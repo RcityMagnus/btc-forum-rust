@@ -54,6 +54,39 @@ pub fn load_pm_spam_settings(ctx: &ForumContext) -> PmSpamSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MentionSettings {
+    pub enable_mentions: bool,
+    pub email_notify_by_default: bool,
+}
+
+impl Default for MentionSettings {
+    fn default() -> Self {
+        Self {
+            enable_mentions: true,
+            email_notify_by_default: false,
+        }
+    }
+}
+
+pub fn save_mention_settings(
+    ctx: &mut ForumContext,
+    settings: MentionSettings,
+) -> ServiceResult<()> {
+    ctx.mod_settings
+        .set("enable_mentions", settings.enable_mentions);
+    ctx.mod_settings
+        .set("mention_email_notify", settings.email_notify_by_default);
+    Ok(())
+}
+
+pub fn load_mention_settings(ctx: &ForumContext) -> MentionSettings {
+    MentionSettings {
+        enable_mentions: ctx.mod_settings.bool("enable_mentions"),
+        email_notify_by_default: ctx.mod_settings.bool("mention_email_notify"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +103,16 @@ mod tests {
         save_pm_spam_settings(&mut ctx, settings).unwrap();
         let loaded = load_pm_spam_settings(&ctx);
         assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn mention_settings_roundtrip() {
+        let mut ctx = ForumContext::default();
+        let settings = MentionSettings {
+            enable_mentions: false,
+            email_notify_by_default: true,
+        };
+        save_mention_settings(&mut ctx, settings).unwrap();
+        assert_eq!(load_mention_settings(&ctx), settings);
     }
 }

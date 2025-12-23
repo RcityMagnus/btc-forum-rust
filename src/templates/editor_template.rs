@@ -11,7 +11,10 @@ pub fn render_editor(control: &RichEditControl) -> String {
     html.push_str(&control.value);
     html.push_str("</textarea>\n<div class=\"toolbar\">");
     for button in &control.buttons {
-        html.push_str(&format!("<button data-bbc=\"{}\">{}</button>", button, button));
+        html.push_str(&format!(
+            "<button data-bbc=\"{}\">{}</button>",
+            button, button
+        ));
     }
     html.push_str("</div>");
     html

@@ -38,7 +38,22 @@ pub fn set_notify_prefs<S: ForumService>(
     member_id: i64,
     prefs: &[(String, i32)],
 ) -> ServiceResult<()> {
-    service.set_alert_prefs(member_id, prefs)
+    if prefs.is_empty() {
+        return Ok(());
+    }
+    let clamped: Vec<_> = prefs
+        .iter()
+        .map(|(key, value)| {
+            let mut val = *value;
+            if val < -128 {
+                val = -128;
+            } else if val > 127 {
+                val = 127;
+            }
+            (key.clone(), val)
+        })
+        .collect();
+    service.set_alert_prefs(member_id, &clamped)
 }
 
 pub fn delete_notify_prefs<S: ForumService>(
@@ -46,6 +61,9 @@ pub fn delete_notify_prefs<S: ForumService>(
     member_id: i64,
     prefs: &[String],
 ) -> ServiceResult<()> {
+    if prefs.is_empty() {
+        return Ok(());
+    }
     service.delete_alert_prefs(member_id, prefs)
 }
 
@@ -57,6 +75,9 @@ pub fn get_member_with_token<S: ForumService>(
     notif_type: &str,
     item_id: i64,
 ) -> ServiceResult<(i64, String)> {
+    if member_id <= 0 || token.is_empty() {
+        return Err(ForumError::Validation("unsubscribe_invalid".into()));
+    }
     let email = if let Some(mail) = email {
         mail
     } else {
@@ -113,5 +134,27 @@ mod tests {
             1,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn set_prefs_clamps_values() {
+        let service = InMemoryService::default();
+        set_notify_prefs(&service, 1, &[("custom_pref".into(), 500)]).unwrap();
+        let prefs = get_notify_prefs(&service, &[1], Some(&["custom_pref".into()]), true).unwrap();
+        assert_eq!(prefs.get(&1).unwrap().get("custom_pref"), Some(&127));
+    }
+
+    #[test]
+    fn invalid_token_rejected() {
+        let service = InMemoryService::default();
+        let result = get_member_with_token(
+            &service,
+            1,
+            Some("alice@example.com".into()),
+            "invalid",
+            "board",
+            1,
+        );
+        assert!(matches!(result, Err(ForumError::Validation(_))));
     }
 }

@@ -1,3 +1,4 @@
+use crate::mentions;
 use crate::services::{
     ForumContext, ForumError, ForumService, PostSubmission, PostedMessage, ServiceResult,
 };
@@ -104,6 +105,7 @@ pub fn create_post<S: ForumService>(
     };
 
     let posted = service.persist_post(ctx, submission)?;
+    process_mentions(service, ctx, msg, posted.message_id)?;
     msg.id = Some(posted.message_id);
     topic.id = Some(posted.topic_id);
 
@@ -135,5 +137,22 @@ pub fn modify_post<S: ForumService>(
         send_notifications: msg.send_notifications,
     };
 
-    service.persist_post(ctx, submission)
+    let result = service.persist_post(ctx, submission)?;
+    process_mentions(service, ctx, msg, message_id)?;
+    Ok(result)
+}
+
+fn process_mentions<S: ForumService>(
+    service: &S,
+    ctx: &ForumContext,
+    msg: &MessageOptions,
+    message_id: i64,
+) -> ServiceResult<()> {
+    if ctx.mod_settings.bool("enable_mentions") && ctx.user_info.permissions.contains("mention") {
+        let members = mentions::get_mentioned_members(service, ctx, &msg.body)?;
+        if !members.is_empty() {
+            mentions::modify_mentions(service, "msg", message_id, members, ctx.user_info.id)?;
+        }
+    }
+    Ok(())
 }

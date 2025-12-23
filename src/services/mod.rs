@@ -201,6 +201,20 @@ pub struct BoardSummary {
     pub name: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BoardNotificationSummary {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TopicNotificationSummary {
+    pub id: i64,
+    pub subject: String,
+    pub board_id: i64,
+    pub board_name: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BoardAccessEntry {
     pub id: i64,
@@ -302,10 +316,29 @@ pub struct PmDraftRecord {
     pub saved_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PmPreferenceState {
     pub receive_from: i32,
     pub notify_level: i32,
+}
+
+impl Default for PmPreferenceState {
+    fn default() -> Self {
+        Self {
+            receive_from: 0,
+            notify_level: 0x01,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MentionRecord {
+    pub id: i64,
+    pub content_type: String,
+    pub content_id: i64,
+    pub author_id: i64,
+    pub mentioned_id: i64,
+    pub time: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -502,6 +535,14 @@ pub struct TopicPostingContext {
     pub id_member_started: i64,
     pub subject: Option<String>,
     pub last_post_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TopicLogEntry {
+    pub member_id: i64,
+    pub topic_id: i64,
+    pub last_msg_id: i64,
+    pub unwatched: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -708,6 +749,25 @@ pub trait ForumService {
     fn delete_draft(&self, draft_id: i64) -> ServiceResult<()>;
     fn read_draft(&self, draft_id: i64) -> ServiceResult<Option<DraftStorage>>;
     fn update_notify_pref(&self, user_id: i64, auto: bool) -> ServiceResult<NotifyPrefs>;
+    fn is_board_notification_set(&self, member_id: i64, board_id: i64) -> ServiceResult<bool>;
+    fn add_board_notification(&self, member_id: i64, board_id: i64) -> ServiceResult<()>;
+    fn remove_board_notification(&self, member_id: i64, board_id: i64) -> ServiceResult<()>;
+    fn is_topic_notification_set(&self, member_id: i64, topic_id: i64) -> ServiceResult<bool>;
+    fn add_topic_notification(&self, member_id: i64, topic_id: i64) -> ServiceResult<()>;
+    fn remove_topic_notification(&self, member_id: i64, topic_id: i64) -> ServiceResult<()>;
+    fn load_topic_log(&self, member_id: i64, topic_id: i64)
+    -> ServiceResult<Option<TopicLogEntry>>;
+    fn save_topic_log(&self, entry: TopicLogEntry) -> ServiceResult<()>;
+    fn list_board_notifications(
+        &self,
+        member_id: i64,
+    ) -> ServiceResult<Vec<BoardNotificationSummary>>;
+    fn list_topic_notifications(
+        &self,
+        member_id: i64,
+    ) -> ServiceResult<Vec<TopicNotificationSummary>>;
+    fn remove_board_notifications(&self, member_id: i64, boards: &[i64]) -> ServiceResult<()>;
+    fn remove_topic_notifications(&self, member_id: i64, topics: &[i64]) -> ServiceResult<()>;
     fn can_link_event(&self, user_id: i64) -> ServiceResult<bool>;
     fn insert_event(&self, event: CalendarEvent) -> ServiceResult<i64>;
     fn modify_event(&self, event_id: i64, event: CalendarEvent) -> ServiceResult<()>;
@@ -799,6 +859,7 @@ pub trait ForumService {
     fn save_pm_preferences(&self, member_id: i64, prefs: &PmPreferenceState) -> ServiceResult<()>;
     fn record_pm_sent(&self, sender_id: i64, timestamp: DateTime<Utc>) -> ServiceResult<()>;
     fn count_pm_sent_since(&self, sender_id: i64, since: DateTime<Utc>) -> ServiceResult<usize>;
+    fn repair_pm_data(&self) -> ServiceResult<usize>;
     fn log_action(
         &self,
         action: &str,
@@ -868,6 +929,18 @@ pub trait ForumService {
         user_id: i64,
         query: &PersonalMessageSearchQuery,
     ) -> ServiceResult<Vec<PersonalMessageSummary>>;
+    fn list_mentions(
+        &self,
+        content_type: &str,
+        content_id: i64,
+    ) -> ServiceResult<Vec<MentionRecord>>;
+    fn insert_mentions(&self, records: &[MentionRecord]) -> ServiceResult<()>;
+    fn delete_mentions(
+        &self,
+        content_type: &str,
+        content_id: i64,
+        member_ids: &[i64],
+    ) -> ServiceResult<()>;
 }
 pub fn bool_to_value(value: bool) -> Value {
     Value::Bool(value)
@@ -951,6 +1024,11 @@ struct InMemoryState {
     buddy_lists: HashMap<i64, Vec<i64>>,
     pm_sent_log: HashMap<i64, Vec<DateTime<Utc>>>,
     pm_preferences: HashMap<i64, PmPreferenceState>,
+    mentions: Vec<MentionRecord>,
+    next_mention_id: i64,
+    board_notifications: HashSet<(i64, i64)>,
+    topic_notifications: HashSet<(i64, i64)>,
+    topic_logs: HashMap<(i64, i64), TopicLogEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -1214,6 +1292,8 @@ impl InMemoryService {
         state.pm_preferences.insert(1, PmPreferenceState::default());
         state.pm_preferences.insert(2, PmPreferenceState::default());
         state.pm_preferences.insert(3, PmPreferenceState::default());
+        state.mentions = Vec::new();
+        state.next_mention_id = 1;
         state.next_group_id = 5;
         state.permission_profiles = vec![
             PermissionProfile {
@@ -1423,7 +1503,8 @@ impl Default for InMemoryService {
 }
 
 impl ForumService for InMemoryService {
-    fn load_language(&self, _ctx: &mut ForumContext, _lang: &str) -> ServiceResult<()> {
+    fn load_language(&self, ctx: &mut ForumContext, lang: &str) -> ServiceResult<()> {
+        crate::language::apply_language(ctx, lang);
         Ok(())
     }
 
@@ -1714,6 +1795,122 @@ impl ForumService for InMemoryService {
         };
         state.notify_prefs.insert(user_id, prefs.clone());
         Ok(prefs)
+    }
+
+    fn is_board_notification_set(&self, member_id: i64, board_id: i64) -> ServiceResult<bool> {
+        let state = self.state.lock().unwrap();
+        Ok(state.board_notifications.contains(&(member_id, board_id)))
+    }
+
+    fn add_board_notification(&self, member_id: i64, board_id: i64) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        state.board_notifications.insert((member_id, board_id));
+        Ok(())
+    }
+
+    fn remove_board_notification(&self, member_id: i64, board_id: i64) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        state.board_notifications.remove(&(member_id, board_id));
+        Ok(())
+    }
+
+    fn is_topic_notification_set(&self, member_id: i64, topic_id: i64) -> ServiceResult<bool> {
+        let state = self.state.lock().unwrap();
+        Ok(state.topic_notifications.contains(&(member_id, topic_id)))
+    }
+
+    fn add_topic_notification(&self, member_id: i64, topic_id: i64) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        state.topic_notifications.insert((member_id, topic_id));
+        Ok(())
+    }
+
+    fn remove_topic_notification(&self, member_id: i64, topic_id: i64) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        state.topic_notifications.remove(&(member_id, topic_id));
+        Ok(())
+    }
+
+    fn load_topic_log(
+        &self,
+        member_id: i64,
+        topic_id: i64,
+    ) -> ServiceResult<Option<TopicLogEntry>> {
+        let state = self.state.lock().unwrap();
+        Ok(state.topic_logs.get(&(member_id, topic_id)).cloned())
+    }
+
+    fn save_topic_log(&self, entry: TopicLogEntry) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .topic_logs
+            .insert((entry.member_id, entry.topic_id), entry);
+        Ok(())
+    }
+
+    fn list_board_notifications(
+        &self,
+        member_id: i64,
+    ) -> ServiceResult<Vec<BoardNotificationSummary>> {
+        let state = self.state.lock().unwrap();
+        let mut summaries = Vec::new();
+        for (owner, board_id) in state.board_notifications.iter() {
+            if *owner == member_id {
+                if let Some(board) = state.boards.get(board_id) {
+                    summaries.push(BoardNotificationSummary {
+                        id: *board_id,
+                        name: board.name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn list_topic_notifications(
+        &self,
+        member_id: i64,
+    ) -> ServiceResult<Vec<TopicNotificationSummary>> {
+        let state = self.state.lock().unwrap();
+        let mut summaries = Vec::new();
+        for (owner, topic_id) in state.topic_notifications.iter() {
+            if *owner == member_id {
+                if let Some(topic) = state.topics.get(topic_id) {
+                    let board_name = state
+                        .boards
+                        .get(&topic.board_id)
+                        .map(|b| b.name.clone())
+                        .unwrap_or_else(|| "Unknown".into());
+                    summaries.push(TopicNotificationSummary {
+                        id: *topic_id,
+                        subject: topic
+                            .subject
+                            .clone()
+                            .unwrap_or_else(|| "(no subject)".into()),
+                        board_id: topic.board_id,
+                        board_name,
+                    });
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn remove_board_notifications(&self, member_id: i64, boards: &[i64]) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        for board in boards {
+            state.board_notifications.remove(&(member_id, *board));
+        }
+        Ok(())
+    }
+
+    fn remove_topic_notifications(&self, member_id: i64, topics: &[i64]) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        for topic in topics {
+            state.topic_notifications.remove(&(member_id, *topic));
+            state.topic_logs.remove(&(member_id, *topic));
+        }
+        Ok(())
     }
 
     fn can_link_event(&self, _user_id: i64) -> ServiceResult<bool> {
@@ -2531,6 +2728,23 @@ impl ForumService for InMemoryService {
         Ok(entry.len())
     }
 
+    fn repair_pm_data(&self) -> ServiceResult<usize> {
+        let mut state = self.state.lock().unwrap();
+        let valid_members: HashSet<i64> = state.members.keys().copied().collect();
+        let mut repaired = 0;
+        let pm_ids: Vec<i64> = state.personal_messages.keys().copied().collect();
+        for pm_id in pm_ids {
+            if let Some(pm) = state.personal_messages.get_mut(&pm_id) {
+                let before = pm.recipients.len();
+                pm.recipients
+                    .retain(|rec| valid_members.contains(&rec.member_id));
+                repaired += before - pm.recipients.len();
+            }
+            self.maybe_remove_pm(&mut state, pm_id);
+        }
+        Ok(repaired)
+    }
+
     fn log_action(
         &self,
         action: &str,
@@ -2939,6 +3153,49 @@ impl ForumService for InMemoryService {
         results.sort_by_key(|summary| summary.sent_at);
         results.reverse();
         Ok(results)
+    }
+
+    fn list_mentions(
+        &self,
+        content_type: &str,
+        content_id: i64,
+    ) -> ServiceResult<Vec<MentionRecord>> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .mentions
+            .iter()
+            .filter(|mention| {
+                mention.content_type == content_type && mention.content_id == content_id
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn insert_mentions(&self, records: &[MentionRecord]) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        for mut record in records.to_vec() {
+            if record.id == 0 {
+                record.id = state.next_mention_id;
+                state.next_mention_id += 1;
+            }
+            state.mentions.push(record);
+        }
+        Ok(())
+    }
+
+    fn delete_mentions(
+        &self,
+        content_type: &str,
+        content_id: i64,
+        member_ids: &[i64],
+    ) -> ServiceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        state.mentions.retain(|mention| {
+            !(mention.content_type == content_type
+                && mention.content_id == content_id
+                && member_ids.contains(&mention.mentioned_id))
+        });
+        Ok(())
     }
 
     fn clean_expired_bans(&self) -> ServiceResult<usize> {
