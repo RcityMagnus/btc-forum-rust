@@ -4,8 +4,8 @@ use crate::editor::{
 };
 use crate::post_ops::{MessageOptions, PosterOptions, TopicOptions, create_post, modify_post};
 use crate::services::{
-    BoardListOptions, ForumContext, ForumError, ForumService, InMemoryService, ServiceResult,
-    SessionCheckMode, TopicPostingContext,
+    BoardListOptions, ForumContext, ForumError, ForumService, ServiceResult, SessionCheckMode,
+    TopicPostingContext,
 };
 use serde_json::json;
 
@@ -475,6 +475,7 @@ impl<S: ForumService> PostController<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::InMemoryService;
     use std::collections::HashSet;
 
     fn base_context() -> ForumContext {
