@@ -39,4 +39,5 @@ pub mod subs_boards;
 pub mod subs_membergroups;
 pub mod subs_members;
 pub mod subs_notify;
+pub mod surreal;
 pub mod who;

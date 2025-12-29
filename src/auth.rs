@@ -1,11 +1,13 @@
 use std::env;
 
 use axum::{
-    async_trait,
+    RequestPartsExt, async_trait,
     extract::FromRequestParts,
     http::request::Parts,
     response::{IntoResponse, Response},
 };
+use axum_extra::TypedHeader;
+use axum_extra::headers::{Authorization, authorization::Bearer};
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 
@@ -51,10 +53,6 @@ where
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        use axum::{
-            TypedHeader,
-            headers::{Authorization, authorization::Bearer},
-        };
         let TypedHeader(Authorization(bearer)) = parts
             .extract::<TypedHeader<Authorization<Bearer>>>()
             .await
