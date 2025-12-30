@@ -1,38 +1,36 @@
 use std::env;
 
 use serde_json::Value;
-use surrealdb::{Surreal, engine::remote::ws::Ws, opt::auth::Root};
+use surrealdb::{
+    Surreal,
+    engine::remote::http::{Client, Http},
+    opt::auth::Root,
+};
 use tracing::info;
 
-pub type SurrealClient = Surreal<Ws>;
+pub type SurrealClient = Surreal<Client>;
 
 fn normalize_endpoint(raw: String) -> String {
-    let mut ep = raw.trim().to_string();
-    if ep.starts_with("http://") {
-        ep = ep.replacen("http://", "ws://", 1);
-    } else if ep.starts_with("https://") {
-        ep = ep.replacen("https://", "ws://", 1);
-    } else if !ep.starts_with("ws://") && !ep.starts_with("wss://") {
-        ep = format!("ws://{}", ep);
+    let ep = raw.trim().to_string();
+    if ep.starts_with("http://") || ep.starts_with("https://") {
+        ep
+    } else {
+        format!("http://{ep}")
     }
-    if ep == "ws://health" || ep == "ws://http//health" {
-        ep = "ws://127.0.0.1:8000".into();
-    }
-    ep
 }
 
 /// Connect to SurrealDB using environment variables, defaults to local root account.
 pub async fn connect_from_env() -> Result<SurrealClient, surrealdb::Error> {
     let endpoint_raw =
-        env::var("SURREAL_ENDPOINT").unwrap_or_else(|_| "ws://127.0.0.1:8000".into());
+        env::var("SURREAL_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:8000".into());
     let endpoint = normalize_endpoint(endpoint_raw);
     let ns = env::var("SURREAL_NAMESPACE").unwrap_or_else(|_| "auth".into());
     let db = env::var("SURREAL_DATABASE").unwrap_or_else(|_| "main".into());
     let user = env::var("SURREAL_USER").unwrap_or_else(|_| "root".into());
     let pass = env::var("SURREAL_PASS").unwrap_or_else(|_| "root".into());
 
-    info!(endpoint, namespace = %ns, database = %db, "connecting to SurrealDB (WS)");
-    let client = Surreal::new::<Ws>(&endpoint).await?;
+    info!(endpoint, namespace = %ns, database = %db, "connecting to SurrealDB (HTTP)");
+    let client = Surreal::new::<Http>(&endpoint).await?;
     client
         .signin(Root {
             username: &user,
@@ -50,6 +48,9 @@ pub async fn create_demo_post(
     body: &str,
     user: &str,
 ) -> Result<Value, surrealdb::Error> {
+    let subject = subject.to_owned();
+    let body = body.to_owned();
+    let user = user.to_owned();
     let mut response = client
         .query(
             r#"
@@ -105,6 +106,9 @@ pub async fn create_post(
     body: &str,
     user: &str,
 ) -> Result<SurrealPost, surrealdb::Error> {
+    let subject = subject.to_owned();
+    let body = body.to_owned();
+    let user = user.to_owned();
     let mut response = client
         .query(
             r#"
@@ -156,6 +160,8 @@ pub async fn create_board(
     name: &str,
     description: Option<&str>,
 ) -> Result<SurrealBoard, surrealdb::Error> {
+    let name = name.to_owned();
+    let description_owned = description.map(|d| d.to_owned());
     let mut response = client
         .query(
             r#"
@@ -167,7 +173,7 @@ pub async fn create_board(
             "#,
         )
         .bind(("name", name))
-        .bind(("description", description))
+        .bind(("description", description_owned))
         .await?;
 
     let board: Option<SurrealBoard> = response.take(0)?;
@@ -199,6 +205,9 @@ pub async fn create_topic(
     subject: &str,
     author: &str,
 ) -> Result<SurrealTopic, surrealdb::Error> {
+    let board_id = board_id.to_owned();
+    let subject = subject.to_owned();
+    let author = author.to_owned();
     let mut response = client
         .query(
             r#"
@@ -231,6 +240,7 @@ pub async fn list_topics(
     client: &SurrealClient,
     board_id: &str,
 ) -> Result<Vec<SurrealTopic>, surrealdb::Error> {
+    let board_id = board_id.to_owned();
     let mut response = client
         .query(
             r#"
@@ -255,6 +265,11 @@ pub async fn create_post_in_topic(
     body: &str,
     author: &str,
 ) -> Result<SurrealPost, surrealdb::Error> {
+    let topic_id = topic_id.to_owned();
+    let board_id = board_id.to_owned();
+    let subject = subject.to_owned();
+    let body = body.to_owned();
+    let author = author.to_owned();
     let mut response = client
         .query(
             r#"
@@ -291,6 +306,7 @@ pub async fn list_posts_for_topic(
     client: &SurrealClient,
     topic_id: &str,
 ) -> Result<Vec<SurrealPost>, surrealdb::Error> {
+    let topic_id = topic_id.to_owned();
     let mut response = client
         .query(
             r#"
@@ -307,4 +323,3 @@ pub async fn list_posts_for_topic(
     let posts: Vec<SurrealPost> = response.take(0)?;
     Ok(posts)
 }
-
