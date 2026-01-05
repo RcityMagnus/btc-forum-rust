@@ -11,12 +11,13 @@ use tracing::info;
 pub type SurrealClient = Surreal<Client>;
 
 fn normalize_endpoint(raw: String) -> String {
-    let ep = raw.trim().to_string();
-    if ep.starts_with("http://") || ep.starts_with("https://") {
-        ep
-    } else {
-        format!("http://{ep}")
-    }
+    // Surreal's HTTP client expects a host:port string. Strip any scheme and trailing slash to
+    // avoid building URLs like `http://http://host:port/health`.
+    let ep = raw.trim().trim_end_matches('/').to_string();
+    ep.strip_prefix("http://")
+        .or_else(|| ep.strip_prefix("https://"))
+        .unwrap_or(&ep)
+        .to_string()
 }
 
 /// Connect to SurrealDB using environment variables, defaults to local root account.
@@ -122,9 +123,9 @@ pub async fn create_post(
             } RETURN meta::id(id) as id, topic_id, board_id, subject, body, author, created_at;
             "#,
         )
-        .bind(("subject", subject))
-        .bind(("body", body))
-        .bind(("user", user))
+        .bind(("subject", subject.clone()))
+        .bind(("body", body.clone()))
+        .bind(("user", user.clone()))
         .await?;
 
     let created: Option<SurrealPost> = response.take(0)?;
@@ -132,9 +133,9 @@ pub async fn create_post(
         id: None,
         topic_id: None,
         board_id: None,
-        subject: subject.to_string(),
-        body: body.to_string(),
-        author: user.to_string(),
+        subject,
+        body,
+        author: user,
         created_at: None,
     }))
 }
@@ -172,15 +173,15 @@ pub async fn create_board(
             } RETURN meta::id(id) as id, name, description, created_at;
             "#,
         )
-        .bind(("name", name))
-        .bind(("description", description_owned))
+        .bind(("name", name.clone()))
+        .bind(("description", description_owned.clone()))
         .await?;
 
     let board: Option<SurrealBoard> = response.take(0)?;
     Ok(board.unwrap_or_else(|| SurrealBoard {
         id: None,
-        name: name.to_string(),
-        description: description.map(|d| d.to_string()),
+        name,
+        description: description_owned,
         created_at: None,
     }))
 }
@@ -220,17 +221,17 @@ pub async fn create_topic(
             } RETURN meta::id(id) as id, board_id, subject, author, created_at, updated_at;
             "#,
         )
-        .bind(("board_id", board_id))
-        .bind(("subject", subject))
-        .bind(("author", author))
+        .bind(("board_id", board_id.clone()))
+        .bind(("subject", subject.clone()))
+        .bind(("author", author.clone()))
         .await?;
 
     let topic: Option<SurrealTopic> = response.take(0)?;
     Ok(topic.unwrap_or_else(|| SurrealTopic {
         id: None,
-        board_id: board_id.to_string(),
-        subject: subject.to_string(),
-        author: author.to_string(),
+        board_id,
+        subject,
+        author,
         created_at: None,
         updated_at: None,
     }))
@@ -283,21 +284,21 @@ pub async fn create_post_in_topic(
             } RETURN meta::id(id) as id, topic_id, board_id, subject, body, author, created_at;
             "#,
         )
-        .bind(("topic_id", topic_id))
-        .bind(("board_id", board_id))
-        .bind(("subject", subject))
-        .bind(("body", body))
-        .bind(("author", author))
+        .bind(("topic_id", topic_id.clone()))
+        .bind(("board_id", board_id.clone()))
+        .bind(("subject", subject.clone()))
+        .bind(("body", body.clone()))
+        .bind(("author", author.clone()))
         .await?;
 
     let post: Option<SurrealPost> = response.take(0)?;
     Ok(post.unwrap_or_else(|| SurrealPost {
         id: None,
-        topic_id: Some(topic_id.to_string()),
-        board_id: Some(board_id.to_string()),
-        subject: subject.to_string(),
-        body: body.to_string(),
-        author: author.to_string(),
+        topic_id: Some(topic_id),
+        board_id: Some(board_id),
+        subject,
+        body,
+        author,
         created_at: None,
     }))
 }
@@ -322,4 +323,94 @@ pub async fn list_posts_for_topic(
 
     let posts: Vec<SurrealPost> = response.take(0)?;
     Ok(posts)
+}
+
+/// Thin service wrapper to encapsulate SurrealDB forum operations.
+#[derive(Clone)]
+pub struct SurrealForumService {
+    client: SurrealClient,
+}
+
+impl SurrealForumService {
+    pub fn new(client: SurrealClient) -> Self {
+        Self { client }
+    }
+
+    pub fn client(&self) -> &SurrealClient {
+        &self.client
+    }
+
+    /// Lightweight connectivity check.
+    pub async fn health(&self) -> Result<(), surrealdb::Error> {
+        self.client.query("RETURN true;").await?;
+        Ok(())
+    }
+
+    pub async fn create_demo_post(
+        &self,
+        subject: &str,
+        body: &str,
+        user: &str,
+    ) -> Result<Value, surrealdb::Error> {
+        create_demo_post(&self.client, subject, body, user).await
+    }
+
+    pub async fn create_board(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<SurrealBoard, surrealdb::Error> {
+        create_board(&self.client, name, description).await
+    }
+
+    pub async fn list_boards(&self) -> Result<Vec<SurrealBoard>, surrealdb::Error> {
+        list_boards(&self.client).await
+    }
+
+    pub async fn create_topic(
+        &self,
+        board_id: &str,
+        subject: &str,
+        author: &str,
+    ) -> Result<SurrealTopic, surrealdb::Error> {
+        create_topic(&self.client, board_id, subject, author).await
+    }
+
+    pub async fn list_topics(
+        &self,
+        board_id: &str,
+    ) -> Result<Vec<SurrealTopic>, surrealdb::Error> {
+        list_topics(&self.client, board_id).await
+    }
+
+    pub async fn create_post(
+        &self,
+        subject: &str,
+        body: &str,
+        user: &str,
+    ) -> Result<SurrealPost, surrealdb::Error> {
+        create_post(&self.client, subject, body, user).await
+    }
+
+    pub async fn create_post_in_topic(
+        &self,
+        topic_id: &str,
+        board_id: &str,
+        subject: &str,
+        body: &str,
+        author: &str,
+    ) -> Result<SurrealPost, surrealdb::Error> {
+        create_post_in_topic(&self.client, topic_id, board_id, subject, body, author).await
+    }
+
+    pub async fn list_posts_for_topic(
+        &self,
+        topic_id: &str,
+    ) -> Result<Vec<SurrealPost>, surrealdb::Error> {
+        list_posts_for_topic(&self.client, topic_id).await
+    }
+
+    pub async fn list_posts(&self) -> Result<Vec<SurrealPost>, surrealdb::Error> {
+        list_posts(&self.client).await
+    }
 }

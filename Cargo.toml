@@ -20,3 +20,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonwebtoken = "9"
 axum-extra = { version = "0.9", features = ["typed-header"] }
 surrealdb = { version = "2.3.10", features = ["protocol-http"] }
+tower-http = { version = "0.5", features = ["cors"] }

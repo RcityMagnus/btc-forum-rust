@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
@@ -9,28 +9,56 @@ use chrono::Utc;
 use dotenvy::dotenv;
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::PgPool;
 use std::{env, net::SocketAddr};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use btc_forum_rust::{
     auth::AuthClaims,
-    controller::post::PostController,
-    db::{DbConfig, connect_pool, upsert_user_by_sub},
-    services::{ForumContext, ForumError, InMemoryService},
-    surreal::{
-        SurrealClient, SurrealPost, SurrealTopic, connect_from_env, create_board, create_demo_post,
-        create_post as surreal_create_post, create_post_in_topic, create_topic, list_boards,
-        list_posts as surreal_list_posts, list_posts_for_topic, list_topics,
-    },
+    services::{surreal::SurrealService, ForumContext, ForumService},
+    surreal::{SurrealForumService, SurrealPost, SurrealTopic, connect_from_env},
 };
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 struct AppState {
-    db: PgPool,
-    forum: InMemoryService,
-    surreal: SurrealClient,
+    surreal: SurrealForumService,
+    forum_service: SurrealService,
+}
+
+fn claims_sub(claims: &Option<AuthClaims>) -> String {
+    claims
+        .as_ref()
+        .map(|c| c.sub.clone())
+        .unwrap_or_else(|| "guest".into())
+}
+
+fn require_auth(claims: &Option<AuthClaims>) -> Result<&AuthClaims, impl IntoResponse> {
+    if let Some(claims) = claims {
+        Ok(claims)
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"status": "error", "message": "authorization required"})),
+        ))
+    }
+}
+
+fn apply_claims_to_context(ctx: &mut ForumContext, claims: &AuthClaims) {
+    ctx.user_info.is_guest = false;
+    ctx.user_info.name = claims.sub.clone();
+    if let Some(role) = &claims.role {
+        match role.as_str() {
+            "admin" => ctx.user_info.is_admin = true,
+            "mod" => ctx.user_info.is_mod = true,
+            _ => {}
+        }
+    }
+    if let Some(perms) = &claims.permissions {
+        ctx.user_info
+            .permissions
+            .extend(perms.iter().cloned());
+    }
 }
 
 #[tokio::main]
@@ -38,14 +66,12 @@ async fn main() {
     dotenv().ok();
     init_tracing();
 
-    let db_config = DbConfig::from_env();
-    let db = connect_pool(&db_config).expect("failed to configure postgres pool");
-
-    let forum = InMemoryService::new_with_sample();
     let surreal = connect_from_env()
         .await
         .expect("failed to connect to SurrealDB");
-    let state = AppState { db, forum, surreal };
+    let surreal = SurrealForumService::new(surreal);
+    let forum_service = SurrealService::new(surreal.client().clone());
+    let state = AppState { surreal, forum_service };
     let app = Router::new()
         .route("/health", get(health))
         .route("/ui", get(ui))
@@ -64,6 +90,16 @@ async fn main() {
         .route(
             "/surreal/topic/posts",
             get(list_surreal_posts_for_topic).post(create_surreal_topic_post),
+        )
+        .layer(
+            CorsLayer::new()
+                .allow_origin(
+                    "http://127.0.0.1:8080"
+                        .parse::<HeaderValue>()
+                        .expect("invalid CORS origin"),
+                )
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]),
         )
         .with_state(state);
 
@@ -88,13 +124,10 @@ fn init_tracing() {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let db_status = match sqlx::query_scalar::<_, i32>("select 1")
-        .fetch_one(&state.db)
-        .await
-    {
+    let surreal_status = match state.surreal.health().await {
         Ok(_) => json!({"status": "ok"}),
         Err(err) => {
-            error!(error = %err, "database connectivity check failed");
+            error!(error = %err, "surreal connectivity check failed");
             json!({"status": "error", "message": err.to_string()})
         }
     };
@@ -102,8 +135,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(json!({
-            "service": "ok",
-            "db": db_status,
+            "service": "ok (surreal-only)",
+            "surreal": surreal_status,
             "timestamp": Utc::now()
         })),
     )
@@ -160,14 +193,18 @@ async fn ui() -> Html<&'static str> {
     )
 }
 
-async fn demo_surreal(State(state): State<AppState>, claims: AuthClaims) -> impl IntoResponse {
-    match create_demo_post(
-        &state.surreal,
-        "Surreal demo",
-        "Hello from SurrealDB demo endpoint",
-        &claims.sub,
-    )
-    .await
+async fn demo_surreal(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+) -> impl IntoResponse {
+    let sub = match require_auth(&claims) {
+        Ok(c) => c.sub.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    match state
+        .surreal
+        .create_demo_post("Surreal demo", "Hello from SurrealDB demo endpoint", &sub)
+        .await
     {
         Ok(record) => (
             StatusCode::OK,
@@ -196,10 +233,18 @@ struct CreateSurrealPost {
 
 async fn surreal_post(
     State(state): State<AppState>,
-    claims: AuthClaims,
+    claims: Option<AuthClaims>,
     Json(payload): Json<CreateSurrealPost>,
 ) -> impl IntoResponse {
-    match surreal_create_post(&state.surreal, &payload.subject, &payload.body, &claims.sub).await {
+    let sub = match require_auth(&claims) {
+        Ok(c) => c.sub.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    match state
+        .surreal
+        .create_post(&payload.subject, &payload.body, &sub)
+        .await
+    {
         Ok(post) => (
             StatusCode::CREATED,
             Json(json!({
@@ -219,8 +264,8 @@ async fn surreal_post(
     }
 }
 
-async fn surreal_posts(State(state): State<AppState>, _claims: AuthClaims) -> impl IntoResponse {
-    match surreal_list_posts(&state.surreal).await {
+async fn surreal_posts(State(state): State<AppState>, _claims: Option<AuthClaims>) -> impl IntoResponse {
+    match state.surreal.list_posts().await {
         Ok(posts) => (
             StatusCode::OK,
             Json(json!({
@@ -248,15 +293,16 @@ struct CreateBoardPayload {
 
 async fn create_surreal_board(
     State(state): State<AppState>,
-    _claims: AuthClaims,
+    _claims: Option<AuthClaims>,
     Json(payload): Json<CreateBoardPayload>,
 ) -> impl IntoResponse {
-    match create_board(
-        &state.surreal,
-        &payload.name,
-        payload.description.as_deref(),
-    )
-    .await
+    if let Err(resp) = require_auth(&_claims) {
+        return resp.into_response();
+    }
+    match state
+        .surreal
+        .create_board(&payload.name, payload.description.as_deref())
+        .await
     {
         Ok(board) => (
             StatusCode::CREATED,
@@ -274,8 +320,8 @@ async fn create_surreal_board(
     }
 }
 
-async fn surreal_boards(State(state): State<AppState>, _claims: AuthClaims) -> impl IntoResponse {
-    match list_boards(&state.surreal).await {
+async fn surreal_boards(State(state): State<AppState>, _claims: Option<AuthClaims>) -> impl IntoResponse {
+    match state.surreal.list_boards().await {
         Ok(boards) => (
             StatusCode::OK,
             Json(json!({"status": "ok", "boards": boards})),
@@ -301,28 +347,30 @@ struct CreateTopicPayload {
 
 async fn create_surreal_topic(
     State(state): State<AppState>,
-    claims: AuthClaims,
+    claims: Option<AuthClaims>,
     Json(payload): Json<CreateTopicPayload>,
 ) -> impl IntoResponse {
+    let sub = match require_auth(&claims) {
+        Ok(c) => c.sub.clone(),
+        Err(resp) => return resp.into_response(),
+    };
     let topic_result: Result<(SurrealTopic, SurrealPost), surrealdb::Error> = async {
-        let topic = create_topic(
-            &state.surreal,
-            &payload.board_id,
-            &payload.subject,
-            &claims.sub,
-        )
-        .await?;
+        let topic = state
+            .surreal
+            .create_topic(&payload.board_id, &payload.subject, &sub)
+            .await?;
         // create initial post inside the topic
         let topic_id = topic.id.clone().unwrap_or_default();
-        let post = create_post_in_topic(
-            &state.surreal,
-            &topic_id,
-            &payload.board_id,
-            &payload.subject,
-            &payload.body,
-            &claims.sub,
-        )
-        .await?;
+        let post = state
+            .surreal
+            .create_post_in_topic(
+                &topic_id,
+                &payload.board_id,
+                &payload.subject,
+                &payload.body,
+                &sub,
+            )
+            .await?;
         Ok((topic, post))
     }
     .await;
@@ -351,10 +399,10 @@ struct ListTopicsParams {
 
 async fn list_surreal_topics(
     State(state): State<AppState>,
-    _claims: AuthClaims,
+    _claims: Option<AuthClaims>,
     Query(params): Query<ListTopicsParams>,
 ) -> impl IntoResponse {
-    match list_topics(&state.surreal, &params.board_id).await {
+    match state.surreal.list_topics(&params.board_id).await {
         Ok(topics) => (
             StatusCode::OK,
             Json(json!({"status": "ok", "topics": topics})),
@@ -381,19 +429,24 @@ struct CreatePostPayload {
 
 async fn create_surreal_topic_post(
     State(state): State<AppState>,
-    claims: AuthClaims,
+    claims: Option<AuthClaims>,
     Json(payload): Json<CreatePostPayload>,
 ) -> impl IntoResponse {
+    let sub = match require_auth(&claims) {
+        Ok(c) => c.sub.clone(),
+        Err(resp) => return resp.into_response(),
+    };
     let subject = payload.subject.as_deref().unwrap_or("Re: topic");
-    match create_post_in_topic(
-        &state.surreal,
-        &payload.topic_id,
-        &payload.board_id,
-        subject,
-        &payload.body,
-        &claims.sub,
-    )
-    .await
+    match state
+        .surreal
+        .create_post_in_topic(
+            &payload.topic_id,
+            &payload.board_id,
+            subject,
+            &payload.body,
+            &sub,
+        )
+        .await
     {
         Ok(post) => (
             StatusCode::CREATED,
@@ -418,10 +471,10 @@ struct ListPostsParams {
 
 async fn list_surreal_posts_for_topic(
     State(state): State<AppState>,
-    _claims: AuthClaims,
+    _claims: Option<AuthClaims>,
     Query(params): Query<ListPostsParams>,
 ) -> impl IntoResponse {
-    match list_posts_for_topic(&state.surreal, &params.topic_id).await {
+    match state.surreal.list_posts_for_topic(&params.topic_id).await {
         Ok(posts) => (
             StatusCode::OK,
             Json(json!({"status": "ok", "posts": posts})),
@@ -438,50 +491,53 @@ async fn list_surreal_posts_for_topic(
     }
 }
 
-async fn demo_post(State(state): State<AppState>, claims: AuthClaims) -> impl IntoResponse {
-    if let Err(err) = upsert_user_by_sub(&state.db, &claims.sub).await {
-        error!(error = %err, "failed to upsert user");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"status": "error", "message": "failed to sync user"})),
-        )
-            .into_response();
+async fn demo_post(State(state): State<AppState>, claims: Option<AuthClaims>) -> impl IntoResponse {
+    let sub = match require_auth(&claims) {
+        Ok(c) => c.sub.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    let mut ctx = ForumContext::default();
+    if let Some(claims) = &claims {
+        apply_claims_to_context(&mut ctx, claims);
+    } else {
+        ctx.user_info.name = sub.clone();
+        ctx.user_info.is_guest = false;
+        ctx.user_info
+            .permissions
+            .extend(["post_new".into(), "post_reply_any".into(), "pm_read".into(), "pm_send".into()]);
     }
 
-    let service = state.forum.clone();
-    let controller = PostController::new(service);
-
-    let mut ctx = ForumContext::default();
-    ctx.board_id = Some(1);
-    ctx.user_info.is_guest = false;
-    ctx.user_info.permissions.insert("post_new".into());
-    ctx.context.set("becomes_approved", true);
-    ctx.post_vars.set("subject", "API example");
-    ctx.post_vars
-        .set("message", "Hello from Axum demo endpoint");
-
-    match controller.post2(&mut ctx) {
-        Ok(_) => (
+    match state
+        .forum_service
+        .persist_post(
+            &ctx,
+            btc_forum_rust::services::PostSubmission {
+                topic_id: None,
+                board_id: 0,
+                message_id: None,
+                subject: "API example".into(),
+                body: "Hello from Axum demo endpoint".into(),
+                icon: "xx".into(),
+                approved: true,
+                send_notifications: false,
+            },
+        )
+    {
+        Ok(posted) => (
             StatusCode::OK,
             Json(json!({
                 "status": "ok",
-                "last_post_id": ctx.context.int("last_post_id"),
-                "board_id": ctx.board_id
+                "topic_id": posted.topic_id,
+                "post_id": posted.message_id,
+                "author": sub
             })),
         )
             .into_response(),
-        Err(err) => {
-            let status = match err {
-                ForumError::PermissionDenied(_) => StatusCode::FORBIDDEN,
-                ForumError::Validation(_) => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (
-                status,
-                Json(json!({ "status": "error", "message": err.to_string() })),
-            )
-                .into_response()
-        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": err.to_string()})),
+        )
+            .into_response(),
     }
 }
 

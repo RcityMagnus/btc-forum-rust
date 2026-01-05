@@ -17,6 +17,8 @@ pub struct AuthClaims {
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
+    pub role: Option<String>,
+    pub permissions: Option<Vec<String>>,
     pub session_id: Option<String>,
 }
 

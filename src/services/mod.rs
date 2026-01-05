@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+pub mod surreal;
+
 pub type ServiceResult<T> = Result<T, ForumError>;
 
 #[derive(Debug, Error)]

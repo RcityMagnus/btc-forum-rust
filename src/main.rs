@@ -1,9 +1,15 @@
 use btc_forum_rust::controller::post::PostController;
 use btc_forum_rust::personal_messages::{PersonalMessageController, ssi_welcome};
-use btc_forum_rust::services::{ForumContext, InMemoryService};
+use btc_forum_rust::services::{ForumContext, surreal::SurrealService};
+use btc_forum_rust::surreal::connect_from_env;
 
 fn main() {
-    let service = InMemoryService::default();
+    let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
+    let surreal_client = rt
+        .block_on(connect_from_env())
+        .expect("failed to connect to SurrealDB");
+    let service = SurrealService::new(surreal_client);
+
     let post_controller = PostController::new(service.clone());
     let pm_controller = PersonalMessageController::new(service.clone());
 
