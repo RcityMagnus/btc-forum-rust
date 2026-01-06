@@ -37,12 +37,36 @@
 - `permissions`: 数组，按需存储字符串权限（如 `post_new`/`post_reply_any` 等）
 - 其他：`created_at`/`updated_at` 等
 
-说明：当前代码使用 `ForumContext.user_info`（内存构造）作为权限来源；后续可从 users 表加载并填充 `permissions`、`is_admin`/`is_mod` 等字段。
+说明：代码会在需要时按 `name=sub` 查询/创建用户，填充 `ForumContext.user_info` 的 `role`/`permissions`，`admin`/`mod` 角色会赋予 `is_admin`/`is_mod`。
 
-## personal_messages（占位）
-- 规划字段：`id`、`sender_id`、`recipient_id`、`subject`、`body`、`is_read`、`created_at`
-- 当前未在代码中启用，后续落地 PM 流程时补充操作。
+## personal_messages（基础版）
+- `pm_id`: 数字型业务 id（毫秒时间戳）
+- `owner_id`: 收件人/发件人所属用户 id
+- `sender_id`/`sender_name`: 发送者信息
+- `subject` / `body`
+- `is_read`: 是否已读
+- `folder`: `"Inbox"` 或 `"Sent"`
+- `recipients`: 收件人 id 列表
+- `created_at_ms`: 发送时间（毫秒）
+
+## attachments（基础版）
+- `id`: 数字型 id（毫秒时间戳）
+- `name` / `tmp_path` / `size` / `mime_type` / `width` / `height`
+- `message_id`: 关联帖子 id，可空
+- `approved`: 是否通过
+- `created_at_ms`: 创建时间
+
+## polls / poll_options（基础版）
+- `polls`: `id`、`topic_id`、`question`、`max_votes`、`change_vote`、`guest_vote`、`created_at_ms`
+- `poll_options`: `poll_id`、`option_id`、`label`、`votes`
+
+## ban_rules / ban_logs / action_logs
+- `ban_rules`: `id`、`reason`、`expires_at_ms`
+- `ban_logs`: `id`、`ban_id`、`email`、`hit_at_ms`
+- `action_logs`: `id`、`action`、`member_id`、`details`、`created_at_ms`
 
 说明：
 - SurrealService 中的发帖/回帖路径使用上述字段；其余 ForumService 方法目前返回空/占位，后续按需要实现。
 - 作者/身份默认取 JWT `sub`，匿名为 `guest`。默认会在缺版块时创建 `General` 版块。
+- 权限要求：创建版块需 `manage_boards` 或管理员角色；创建主题需 `post_new`；回帖需 `post_reply_any`。JWT 中未携带权限时，会为普通用户填充 `post_new`/`post_reply_any` 便于调试。
+- 未实现的版主管理/成员管理等接口仍会显式返回 “not supported in SurrealService”。私信、附件、投票、封禁/审计日志已有基础能力。

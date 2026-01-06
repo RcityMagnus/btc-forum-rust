@@ -325,6 +325,83 @@ pub async fn list_posts_for_topic(
     Ok(posts)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SurrealUser {
+    pub id: Option<String>,
+    pub name: String,
+    pub role: Option<String>,
+    pub permissions: Option<Vec<String>>,
+    pub created_at: Option<String>,
+}
+
+pub async fn get_user_by_name(
+    client: &SurrealClient,
+    name: &str,
+) -> Result<Option<SurrealUser>, surrealdb::Error> {
+    let name = name.to_owned();
+    let mut response = client
+        .query(
+            r#"
+            SELECT meta::id(id) as id, name, role, permissions, created_at
+            FROM users
+            WHERE name = $name
+            LIMIT 1;
+            "#,
+        )
+        .bind(("name", name))
+        .await?;
+    let user: Option<SurrealUser> = response.take(0)?;
+    Ok(user)
+}
+
+pub async fn create_user(
+    client: &SurrealClient,
+    name: &str,
+    role: Option<&str>,
+    permissions: Option<&[String]>,
+) -> Result<SurrealUser, surrealdb::Error> {
+    let name = name.to_owned();
+    let role = role
+        .map(|r| r.to_owned())
+        .unwrap_or_else(|| "member".into());
+    let perms = permissions.map(|p| p.to_owned()).unwrap_or_default();
+    let mut response = client
+        .query(
+            r#"
+            CREATE users CONTENT {
+                name: $name,
+                role: $role,
+                permissions: $permissions,
+                created_at: time::now()
+            } RETURN meta::id(id) as id, name, role, permissions, created_at;
+            "#,
+        )
+        .bind(("name", name.clone()))
+        .bind(("role", role.clone()))
+        .bind(("permissions", perms.clone()))
+        .await?;
+    let user: Option<SurrealUser> = response.take(0)?;
+    Ok(user.unwrap_or_else(|| SurrealUser {
+        id: None,
+        name,
+        role: Some(role),
+        permissions: Some(perms),
+        created_at: None,
+    }))
+}
+
+pub async fn ensure_user(
+    client: &SurrealClient,
+    name: &str,
+    role: Option<&str>,
+    permissions: Option<&[String]>,
+) -> Result<SurrealUser, surrealdb::Error> {
+    if let Some(user) = get_user_by_name(client, name).await? {
+        return Ok(user);
+    }
+    create_user(client, name, role, permissions).await
+}
+
 /// Thin service wrapper to encapsulate SurrealDB forum operations.
 #[derive(Clone)]
 pub struct SurrealForumService {
@@ -376,10 +453,7 @@ impl SurrealForumService {
         create_topic(&self.client, board_id, subject, author).await
     }
 
-    pub async fn list_topics(
-        &self,
-        board_id: &str,
-    ) -> Result<Vec<SurrealTopic>, surrealdb::Error> {
+    pub async fn list_topics(&self, board_id: &str) -> Result<Vec<SurrealTopic>, surrealdb::Error> {
         list_topics(&self.client, board_id).await
     }
 
@@ -412,5 +486,14 @@ impl SurrealForumService {
 
     pub async fn list_posts(&self) -> Result<Vec<SurrealPost>, surrealdb::Error> {
         list_posts(&self.client).await
+    }
+
+    pub async fn ensure_user(
+        &self,
+        name: &str,
+        role: Option<&str>,
+        permissions: Option<&[String]>,
+    ) -> Result<SurrealUser, surrealdb::Error> {
+        ensure_user(&self.client, name, role, permissions).await
     }
 }

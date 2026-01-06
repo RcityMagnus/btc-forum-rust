@@ -310,7 +310,7 @@ pub struct PmPreferenceState {
     pub notify_level: i32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct MemberRecord {
     pub id: i64,
     pub name: String,

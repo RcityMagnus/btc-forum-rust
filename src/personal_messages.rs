@@ -384,7 +384,7 @@ impl<S: ForumService> PersonalMessageController<S> {
             recipients,
             subject,
             body,
-            store_outbox: ctx.post_vars.bool("outbox"),
+            _store_outbox: ctx.post_vars.bool("outbox"),
         }
     }
 
@@ -538,7 +538,7 @@ struct PmFormState {
     recipients: RecipientInput,
     subject: String,
     body: String,
-    store_outbox: bool,
+    _store_outbox: bool,
 }
 
 impl ToString for PersonalMessageFolder {
