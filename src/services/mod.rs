@@ -1534,6 +1534,9 @@ impl ForumService for InMemoryService {
         _ctx: &ForumContext,
         submission: PostSubmission,
     ) -> ServiceResult<PostedMessage> {
+        if submission.subject.trim().is_empty() || submission.body.trim().is_empty() {
+            return Err(ForumError::Validation("no_subject_or_body".into()));
+        }
         let mut state = self.state.lock().unwrap();
         let _notifications = submission.send_notifications;
         let topic_id = if let Some(id) = submission.topic_id {

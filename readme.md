@@ -21,9 +21,11 @@
 - 测试：目前无测试，可按惯例添加 `#[cfg(test)]` 单测或 `tests/` 集成测，运行 `cargo test`。
 
 ## 配置与监控
-- 环境变量：`SURREAL_ENDPOINT`（必填）、`SURREAL_NAMESPACE`、`SURREAL_DATABASE`、`SURREAL_USER`、`SURREAL_PASS`、`JWT_SECRET`、`BIND_ADDR`（默认 `127.0.0.1:3000`）。
-- 安全：写接口必须携带 Bearer JWT，已启用内容长度校验与用户+IP 限流（默认 60 秒窗口，接口不同上限）；CORS 允许 `http://127.0.0.1:8080`。
+- 环境变量：`SURREAL_ENDPOINT`（必填）、`SURREAL_NAMESPACE`、`SURREAL_DATABASE`、`SURREAL_USER`、`SURREAL_PASS`、`JWT_SECRET`、`BIND_ADDR`（默认 `127.0.0.1:3000`），示例见 `.env.example`。开发期可用 `ENFORCE_CSRF=0` 暂停 CSRF 校验（默认开启）。
+- 安全：写接口必须携带 Bearer JWT，已启用内容长度校验与用户+IP 限流（默认 60 秒窗口，接口不同上限）；CORS 允许 `http://127.0.0.1:8080`（可用 `CORS_ORIGIN` 覆盖），默认允许凭据便于 Cookie/CSRF。
+- 观测：新增 `/metrics` 简单返回服务启动时长与当前限流 key 计数（仅开发用途）。
 - 日志：启用 tracing，HTTP 请求使用 `TraceLayer` 打印基础请求日志；管理/通知错误会记审计日志表。
+- XSS/CSRF：输入将使用 `ammonia` 基础清洗后入库；模板/前端输出请保持 HTML 转义。CSRF 方案尚未落地，前后端可按双提交/同源策略补充 token 校验。
 
 ## 目录概览
 - `src/main.rs`：演示入口，初始化 SurrealService 并调用控制器。

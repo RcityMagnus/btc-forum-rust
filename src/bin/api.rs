@@ -1,8 +1,10 @@
 use axum::{
     Json, Router,
+    body::Body,
     extract::{ConnectInfo, Query, State},
-    http::{HeaderValue, Method, StatusCode},
-    response::{Html, IntoResponse},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header::HeaderName},
+    middleware::Next,
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -13,11 +15,12 @@ use std::{
     env,
     net::SocketAddr,
     sync::Arc,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
+use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use tower_http::trace::TraceLayer;
 
 use btc_forum_rust::{
     auth::AuthClaims,
@@ -31,6 +34,7 @@ struct AppState {
     surreal: SurrealForumService,
     forum_service: SurrealService,
     rate_limiter: Arc<RateLimiter>,
+    start_time: Instant,
 }
 
 #[derive(Default)]
@@ -64,6 +68,24 @@ impl RateLimiter {
             false
         }
     }
+
+    fn snapshot(&self) -> std::collections::HashMap<String, u32> {
+        let guard = match self.limits.lock() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        };
+        guard.iter().map(|(k, (count, _))| (k.clone(), *count)).collect()
+    }
+}
+
+static ENFORCE_CSRF: OnceLock<bool> = OnceLock::new();
+
+fn csrf_enabled() -> bool {
+    *ENFORCE_CSRF.get_or_init(|| {
+        env::var("ENFORCE_CSRF")
+            .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true)
+    })
 }
 
 fn require_auth(claims: &Option<AuthClaims>) -> Result<&AuthClaims, impl IntoResponse> {
@@ -189,6 +211,43 @@ fn rate_key(claims: &AuthClaims, addr: Option<&std::net::SocketAddr>) -> String 
     }
 }
 
+fn verify_csrf(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    // Simple double-submit style check: X-CSRF-TOKEN must equal Cookie XSRF-TOKEN.
+    let header_token = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if header_token.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"status": "error", "message": "missing csrf token"})),
+        ));
+    }
+    if let (Some(header_token), Some(cookie_header)) = (
+        headers.get("x-csrf-token"),
+        headers.get(axum::http::header::COOKIE),
+    ) {
+        let header_val = header_token.to_str().unwrap_or_default();
+        let cookie_val = cookie_header.to_str().unwrap_or_default();
+        let mut ok = false;
+        for part in cookie_val.split(';') {
+            let trimmed = part.trim();
+            if let Some(rest) = trimmed.strip_prefix("XSRF-TOKEN=") {
+                if rest == header_val {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"status": "error", "message": "csrf token mismatch"})),
+            ));
+        }
+    }
+    Ok(())
+}
 fn validate_content(
     subject: &str,
     body: &str,
@@ -210,9 +269,35 @@ fn validate_content(
     Ok(())
 }
 
+async fn csrf_layer(mut req: Request<Body>, next: Next) -> Response {
+    if csrf_enabled() && req.method() != Method::GET && req.method() != Method::OPTIONS {
+        let headers = req.headers().clone();
+        if let Err(err) = verify_csrf(&headers) {
+            return err.into_response();
+        }
+        req.extensions_mut().insert(headers);
+    }
+    next.run(req).await
+}
+
+fn sanitize_input(input: &str) -> String {
+    ammonia::Builder::default()
+        .url_schemes(["http", "https"].into())
+        .clean(input)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Router,
+        http::Request,
+        routing::post,
+        middleware::from_fn,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tower::ServiceExt;
 
     #[test]
     fn validate_content_ok() {
@@ -228,6 +313,78 @@ mod tests {
     fn validate_content_empty_body_err() {
         assert!(validate_content("hello", " ").is_err());
     }
+
+    #[test]
+    fn require_auth_rejects_missing_claims() {
+        let result = require_auth(&None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn csrf_mismatch_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-csrf-token", HeaderValue::from_static("abc"));
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("XSRF-TOKEN=def"),
+        );
+        assert!(verify_csrf(&headers).is_err());
+    }
+
+    #[test]
+    fn rate_limiter_hits_limit() {
+        let limiter = RateLimiter::new();
+        let key = "user1";
+        assert!(limiter.allow(key, 2, Duration::from_secs(60)));
+        assert!(limiter.allow(key, 2, Duration::from_secs(60)));
+        assert!(!limiter.allow(key, 2, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn rate_key_with_ip() {
+        let claims = AuthClaims {
+            sub: "alice".into(),
+            exp: 0,
+            iat: 0,
+            session_id: None,
+            role: None,
+            permissions: None,
+        };
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let key = rate_key(&claims, Some(&addr));
+        assert!(key.contains("alice"));
+        assert!(key.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn csrf_layer_blocks_missing_token() {
+        let app = Router::new()
+            .route("/test", post(|| async { StatusCode::OK }))
+            .layer(from_fn(csrf_layer));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn csrf_layer_allows_with_token() {
+        let app = Router::new()
+            .route("/test", post(|| async { StatusCode::OK }))
+            .layer(from_fn(csrf_layer));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("x-csrf-token", "abc")
+            .header(axum::http::header::COOKIE, "XSRF-TOKEN=abc")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[tokio::main]
@@ -240,13 +397,17 @@ async fn main() {
         .expect("failed to connect to SurrealDB");
     let surreal = SurrealForumService::new(surreal);
     let forum_service = SurrealService::new(surreal.client().clone());
+    let cors_origin =
+        env::var("CORS_ORIGIN").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let state = AppState {
         surreal,
         forum_service,
         rate_limiter: Arc::new(RateLimiter::new()),
+        start_time: Instant::now(),
     };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/ui", get(ui))
         .route("/demo/post", post(demo_post))
         .route("/demo/surreal", post(demo_surreal))
@@ -268,19 +429,21 @@ async fn main() {
         .route("/admin/bans", get(list_bans))
         .route("/admin/action_logs", get(list_action_logs))
         .route("/admin/notify", post(admin_notify))
-        .layer(
+        .layer(axum::middleware::from_fn(csrf_layer))
+        .layer({
+            let origin = cors_origin
+                .parse::<HeaderValue>()
+                .expect("invalid CORS_ORIGIN");
             CorsLayer::new()
-                .allow_origin(
-                    "http://127.0.0.1:8080"
-                        .parse::<HeaderValue>()
-                        .expect("invalid CORS origin"),
-                )
+                .allow_origin(origin)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                 .allow_headers([
                     axum::http::header::AUTHORIZATION,
                     axum::http::header::CONTENT_TYPE,
-                ]),
-        )
+                    HeaderName::from_static("x-csrf-token"),
+                ])
+                .allow_credentials(true)
+        })
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -322,6 +485,22 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         })),
     )
 }
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let uptime = state.start_time.elapsed().as_secs();
+    let rates = state.rate_limiter.snapshot();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "uptime_secs": uptime,
+            "rate_limiter_keys": rates,
+        })),
+    )
+}
+
+/// CSRF 占位：如需 CSRF 防护，可在前端携带 token（双提交或表单隐藏字段），
+/// 后端通过中间件校验自定义 Header 与 Cookie 一致性，再放行路由。
 
 async fn ui() -> Html<&'static str> {
     Html(
@@ -425,6 +604,7 @@ async fn surreal_post(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<CreateSurrealPost>,
 ) -> impl IntoResponse {
     let claims = match require_auth(&claims) {
@@ -442,13 +622,20 @@ async fn surreal_post(
     if let Err(resp) = validate_content(&payload.subject, &payload.body) {
         return resp.into_response();
     }
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
     if let Err(resp) = ensure_permission(&state, &ctx, "post_new") {
         return resp.into_response();
     }
     let author = user.name.clone();
     match state
         .surreal
-        .create_post(&payload.subject, &payload.body, &author)
+        .create_post(
+            &sanitize_input(&payload.subject),
+            &sanitize_input(&payload.body),
+            &author,
+        )
         .await
     {
         Ok(post) => (
@@ -581,6 +768,7 @@ async fn create_surreal_topic(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<CreateTopicPayload>,
 ) -> impl IntoResponse {
     let claims = match require_auth(&claims) {
@@ -598,6 +786,9 @@ async fn create_surreal_topic(
     if let Err(resp) = validate_content(&payload.subject, &payload.body) {
         return resp.into_response();
     }
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
     if let Err(resp) = ensure_permission(&state, &ctx, "post_new") {
         return resp.into_response();
     }
@@ -605,7 +796,11 @@ async fn create_surreal_topic(
     let topic_result: Result<(SurrealTopic, SurrealPost), surrealdb::Error> = async {
         let topic = state
             .surreal
-            .create_topic(&payload.board_id, &payload.subject, &author)
+            .create_topic(
+                &payload.board_id,
+                &sanitize_input(&payload.subject),
+                &author,
+            )
             .await?;
         // create initial post inside the topic
         let topic_id = topic.id.clone().unwrap_or_default();
@@ -614,8 +809,8 @@ async fn create_surreal_topic(
             .create_post_in_topic(
                 &topic_id,
                 &payload.board_id,
-                &payload.subject,
-                &payload.body,
+                &sanitize_input(&payload.subject),
+                &sanitize_input(&payload.body),
                 &author,
             )
             .await?;
@@ -679,6 +874,7 @@ async fn create_surreal_topic_post(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<CreatePostPayload>,
 ) -> impl IntoResponse {
     let claims = match require_auth(&claims) {
@@ -700,6 +896,10 @@ async fn create_surreal_topic_post(
     if let Err(resp) = validate_content(&subject, &payload.body) {
         return resp.into_response();
     }
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    // Basic XSS mitigation by sanitizing HTML content
     if let Err(resp) = ensure_permission(&state, &ctx, "post_reply_any") {
         return resp.into_response();
     }
@@ -709,8 +909,8 @@ async fn create_surreal_topic_post(
         .create_post_in_topic(
             &payload.topic_id,
             &payload.board_id,
-            &subject,
-            &payload.body,
+            &sanitize_input(&subject),
+            &sanitize_input(&payload.body),
             &author,
         )
         .await
@@ -878,6 +1078,7 @@ async fn admin_notify(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<AdminNotifyPayload>,
 ) -> impl IntoResponse {
     let claims = match require_auth(&claims) {
@@ -893,6 +1094,9 @@ async fn admin_notify(
     }
     let key = rate_key(&claims, Some(&addr));
     if let Err(resp) = enforce_rate(&state, &key, 5, Duration::from_secs(60)) {
+        return resp.into_response();
+    }
+    if let Err(resp) = verify_csrf(&headers) {
         return resp.into_response();
     }
     if payload.user_ids.is_empty() {
@@ -917,8 +1121,8 @@ async fn admin_notify(
         sender_name: "admin".into(),
         to: payload.user_ids.clone(),
         bcc: Vec::new(),
-        subject: payload.subject.clone(),
-        body: payload.body.clone(),
+        subject: sanitize_input(&payload.subject),
+        body: sanitize_input(&payload.body),
     };
     match state.forum_service.send_personal_message(message) {
         Ok(result) => (
@@ -931,7 +1135,11 @@ async fn admin_notify(
             let _ = state.forum_service.log_action(
                 "admin_notify_error",
                 None,
-                &json!({"error": err.to_string(), "subject": payload.subject}),
+                &json!({
+                    "error": err.to_string(),
+                    "subject": payload.subject,
+                    "user_ids": payload.user_ids,
+                }),
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

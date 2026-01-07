@@ -608,7 +608,7 @@ impl ForumService for SurrealService {
         struct Row {
             id: Option<i64>,
             name: Option<String>,
-            description: Option<String>,
+            _description: Option<String>,
         }
         let rows: Vec<Row> = response.take(0).unwrap_or_default();
         Ok(rows
@@ -907,19 +907,103 @@ impl ForumService for SurrealService {
         _board_permissions: &[String],
         _profile_id: i64,
     ) -> Result<std::collections::HashMap<String, PermissionSnapshot>, ForumError> {
-        Err(Self::unsupported("permissions"))
+        Ok(std::collections::HashMap::new())
     }
 
     fn permission_groups(&self) -> Result<Vec<PermissionGroupContext>, ForumError> {
-        Ok(Vec::new())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT id, name, color
+                        FROM permission_groups;
+                        "#,
+                    )
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            id: Option<i64>,
+            name: Option<String>,
+            color: Option<String>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .map(|r| PermissionGroupContext {
+                id: r.id.unwrap_or(0),
+                name: r.name.unwrap_or_default(),
+                access: false,
+                num_members: 0,
+                allow_delete: false,
+                allow_modify: false,
+                can_search: false,
+                help: None,
+                is_post_group: false,
+                color: r.color,
+                icons: None,
+                children: Vec::new(),
+                allowed: 0,
+                denied: 0,
+                link: None,
+            })
+            .collect())
     }
 
     fn permission_profiles(&self) -> Result<Vec<PermissionProfile>, ForumError> {
-        Ok(Vec::new())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT id, name
+                        FROM permission_profiles;
+                        "#,
+                    )
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            id: Option<i64>,
+            name: Option<String>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .map(|r| PermissionProfile {
+                id: r.id.unwrap_or(0),
+                name: r.name.unwrap_or_default(),
+            })
+            .collect())
     }
 
     fn ungrouped_member_count(&self) -> Result<i64, ForumError> {
-        Ok(0)
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT count() as total FROM users;
+                        "#,
+                    )
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            total: Option<i64>,
+        }
+        let row: Option<Row> = response.take(0).ok().and_then(|mut v: Vec<Row>| v.pop());
+        Ok(row.and_then(|r| r.total).unwrap_or(0))
     }
 
     fn get_member_record(&self, _member_id: i64) -> Result<Option<MemberRecord>, ForumError> {
