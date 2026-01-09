@@ -155,6 +155,7 @@ dependencies = [
  "reqwasm",
  "serde",
  "serde_json",
+ "web-sys",
 ]
 
 [[package]]

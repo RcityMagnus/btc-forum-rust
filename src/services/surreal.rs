@@ -1,7 +1,7 @@
 use crate::services::{
     ActionLogEntry, AttachmentRecord, AttachmentUpload, BanLogEntry, BanRule, BoardAccessEntry,
-    BoardListOptions, BoardSummary, CalendarEvent, DraftStorage, ForumContext, ForumError,
-    ForumService, GroupAssignType, GroupMember, MemberRecord, MembergroupData,
+    AttachmentInfo, BoardListOptions, BoardSummary, CalendarEvent, DraftStorage, ForumContext,
+    ForumError, ForumService, GroupAssignType, GroupMember, MemberRecord, MembergroupData,
     MembergroupListEntry, MembergroupListType, MembergroupSettings, MembergroupSummary,
     MessageData, MessageEditData, NotifyPrefs, PermissionChange, PermissionGroupContext,
     PermissionProfile, PermissionSnapshot, PersonalMessageDetail, PersonalMessageFolder,
@@ -20,6 +20,26 @@ use chrono::{TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PostRow {
+    id: Option<String>,
+    topic_id: String,
+    board_id: String,
+    subject: String,
+    body: String,
+    author: String,
+    created_at: Option<String>,
+}
+
+impl PostRow {
+    fn topic_id_numeric(&self) -> Option<i64> {
+        self.topic_id
+            .split(':')
+            .last()
+            .and_then(|s| s.parse().ok())
+    }
+}
+
 /// Minimal Surreal-backed ForumService implementation.
 ///
 /// Only a subset of methods are implemented to support posting workflows used by controllers.
@@ -31,6 +51,29 @@ pub struct SurrealService {
 impl SurrealService {
     pub fn new(client: SurrealClient) -> Self {
         Self { client }
+    }
+
+    fn fetch_post_row(&self, msg_id: i64) -> Result<Option<PostRow>, ForumError> {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let rid = format!("posts:{msg_id}");
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT meta::id(id) as id, topic_id, board_id, subject, body, author, created_at
+                        FROM posts
+                        WHERE meta::id(id) = $rid
+                        LIMIT 1;
+                        "#,
+                    )
+                    .bind(("rid", rid))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        let row: Option<PostRow> = response.take(0).ok().and_then(|mut v: Vec<PostRow>| v.pop());
+        Ok(row)
     }
 
     fn ensure_board(&self, ctx: &ForumContext) -> Result<String, ForumError> {
@@ -63,10 +106,6 @@ impl SurrealService {
             ))
             .map_err(|e| ForumError::Internal(e.to_string()))?;
         Ok(created.id.unwrap_or_else(|| "board:default".into()))
-    }
-
-    fn unsupported(feature: &str) -> ForumError {
-        ForumError::Internal(format!("{feature} not supported in SurrealService"))
     }
 
     fn parse_ts(ms: i64) -> chrono::DateTime<Utc> {
@@ -152,18 +191,117 @@ impl ForumService for SurrealService {
     }
 
     fn find_topic_id_by_msg(&self, _msg_id: i64) -> Result<Option<i64>, ForumError> {
-        Err(ForumError::Internal(
-            "find_topic_id_by_msg not implemented in SurrealService".into(),
-        ))
+        Ok(self
+            .fetch_post_row(_msg_id)?
+            .and_then(|p| p.topic_id_numeric()))
     }
 
     fn fetch_topic_posting_context(
         &self,
         _topic_id: i64,
     ) -> Result<Option<TopicPostingContext>, ForumError> {
-        Err(ForumError::Internal(
-            "fetch_topic_posting_context not implemented in SurrealService".into(),
-        ))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let rid = format!("topics:{_topic_id}");
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT board_id, subject, created_at, updated_at
+                        FROM topics
+                        WHERE meta::id(id) = $rid
+                        LIMIT 1;
+                        "#,
+                    )
+                    .bind(("rid", rid))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct TopicRow {
+            board_id: Option<String>,
+            subject: Option<String>,
+            created_at: Option<String>,
+            updated_at: Option<String>,
+        }
+        let topic: Option<TopicRow> = response.take(0).ok().and_then(|mut v: Vec<TopicRow>| v.pop());
+        let Some(topic) = topic else {
+            return Ok(None);
+        };
+
+        // Last/first post ids
+        let mut last_resp = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT meta::id(id) as id, created_at
+                        FROM posts
+                        WHERE topic_id = $tid
+                        ORDER BY created_at DESC
+                        LIMIT 1;
+                        "#,
+                    )
+                    .bind(("tid", format!("topics:{_topic_id}")))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        let mut first_resp = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT meta::id(id) as id, created_at
+                        FROM posts
+                        WHERE topic_id = $tid
+                        ORDER BY created_at ASC
+                        LIMIT 1;
+                        "#,
+                    )
+                    .bind(("tid", format!("topics:{_topic_id}")))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct MsgRow {
+            id: Option<String>,
+            created_at: Option<String>,
+        }
+        let last: Option<MsgRow> = last_resp.take(0).ok().and_then(|mut v: Vec<MsgRow>| v.pop());
+        let first: Option<MsgRow> = first_resp.take(0).ok().and_then(|mut v: Vec<MsgRow>| v.pop());
+
+        let parse_dt = |s: Option<String>| {
+            s.and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+        };
+
+        Ok(Some(TopicPostingContext {
+            locked: false,
+            approved: true,
+            notify: false,
+            sticky: false,
+            board_id: topic
+                .board_id
+                .as_deref()
+                .and_then(|id| id.split(':').last())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+            poll_id: None,
+            last_msg_id: last
+                .as_ref()
+                .and_then(|m| m.id.as_deref())
+                .and_then(|id| id.split(':').last())
+                .and_then(|s| s.parse().ok()),
+            first_msg_id: first
+                .as_ref()
+                .and_then(|m| m.id.as_deref())
+                .and_then(|id| id.split(':').last())
+                .and_then(|s| s.parse().ok()),
+            id_member_started: 0,
+            subject: topic.subject,
+            last_post_time: last.and_then(|m| parse_dt(m.created_at)),
+        }))
     }
 
     fn fetch_message_edit_data(
@@ -171,9 +309,29 @@ impl ForumService for SurrealService {
         _topic_id: i64,
         _msg_id: i64,
     ) -> Result<Option<MessageEditData>, ForumError> {
-        Err(ForumError::Internal(
-            "editing messages is not supported in SurrealService".into(),
-        ))
+        let Some(post) = self.fetch_post_row(_msg_id)? else {
+            return Ok(None);
+        };
+        let attachments: Vec<AttachmentInfo> = self
+            .list_message_attachments(_msg_id)?
+            .into_iter()
+            .map(|a| AttachmentInfo {
+                id: a.id,
+                filename: a.name,
+                size: a.size,
+                approved: a.approved,
+            })
+            .collect();
+        Ok(Some(MessageEditData {
+            id_member: 0,
+            topic_id: post.topic_id_numeric().unwrap_or(_topic_id),
+            subject: post.subject,
+            body: post.body,
+            icon: "xx".into(),
+            smileys_enabled: true,
+            approved: true,
+            attachments,
+        }))
     }
 
     fn persist_post(
@@ -236,9 +394,10 @@ impl ForumService for SurrealService {
     }
 
     fn fetch_quote_content(&self, _msg_id: i64) -> Result<Option<QuoteContent>, ForumError> {
-        Err(ForumError::Internal(
-            "fetch_quote_content not implemented in SurrealService".into(),
-        ))
+        Ok(self.fetch_post_row(_msg_id)?.map(|p| QuoteContent {
+            subject: p.subject,
+            body: p.body,
+        }))
     }
 
     fn send_announcement(
@@ -412,19 +571,115 @@ impl ForumService for SurrealService {
         _size_delta: i64,
         _file_delta: i64,
     ) -> Result<(), ForumError> {
+        // Attachment directories are derived from the attachments table; nothing to persist.
         Ok(())
     }
 
-    fn save_draft_record(&self, _record: DraftStorage) -> Result<i64, ForumError> {
-        Err(Self::unsupported("drafts"))
+    fn save_draft_record(&self, mut _record: DraftStorage) -> Result<i64, ForumError> {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let id = if _record.id == 0 {
+            Utc::now().timestamp_millis()
+        } else {
+            _record.id
+        };
+        let poster_time_ms = _record.poster_time.timestamp_millis();
+
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    UPDATE type::thing("drafts", $id) SET
+                        board_id = $board_id,
+                        topic_id = $topic_id,
+                        subject = $subject,
+                        body = $body,
+                        icon = $icon,
+                        smileys_enabled = $smileys_enabled,
+                        locked = $locked,
+                        sticky = $sticky,
+                        poster_time_ms = $poster_time_ms;
+                    "#,
+                )
+                .bind(("id", id))
+                .bind(("board_id", _record.board_id))
+                .bind(("topic_id", _record.topic_id))
+                .bind(("subject", _record.subject.clone()))
+                .bind(("body", _record.body.clone()))
+                .bind(("icon", _record.icon.clone()))
+                .bind(("smileys_enabled", _record.smileys_enabled))
+                .bind(("locked", _record.locked))
+                .bind(("sticky", _record.sticky))
+                .bind(("poster_time_ms", poster_time_ms))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+
+        Ok(id)
     }
 
     fn delete_draft(&self, _draft_id: i64) -> Result<(), ForumError> {
-        Err(Self::unsupported("drafts"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        rt.block_on(async {
+            self.client
+                .query("DELETE drafts WHERE id = $id;")
+                .bind(("id", _draft_id))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(())
     }
 
     fn read_draft(&self, _draft_id: i64) -> Result<Option<DraftStorage>, ForumError> {
-        Err(Self::unsupported("drafts"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT id, board_id, topic_id, subject, body, icon, smileys_enabled, locked, sticky, poster_time_ms
+                        FROM drafts
+                        WHERE id = $id
+                        LIMIT 1;
+                        "#,
+                    )
+                    .bind(("id", _draft_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+
+        #[derive(Deserialize)]
+        struct Row {
+            id: Option<i64>,
+            board_id: Option<i64>,
+            topic_id: Option<i64>,
+            subject: Option<String>,
+            body: Option<String>,
+            icon: Option<String>,
+            smileys_enabled: Option<bool>,
+            locked: Option<bool>,
+            sticky: Option<bool>,
+            poster_time_ms: Option<i64>,
+        }
+
+        let row: Option<Row> = response.take(0).ok().and_then(|mut v: Vec<Row>| v.pop());
+        Ok(row.map(|r| DraftStorage {
+            id: r.id.unwrap_or(_draft_id),
+            board_id: r.board_id.unwrap_or_default(),
+            topic_id: r.topic_id.unwrap_or_default(),
+            subject: r.subject.unwrap_or_default(),
+            body: r.body.unwrap_or_default(),
+            icon: r.icon.unwrap_or_else(|| "xx".into()),
+            smileys_enabled: r.smileys_enabled.unwrap_or(true),
+            locked: r.locked.unwrap_or(false),
+            sticky: r.sticky.unwrap_or(false),
+            poster_time: r
+                .poster_time_ms
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+                .unwrap_or_else(Utc::now),
+        }))
     }
 
     fn update_notify_pref(&self, _user_id: i64, _auto: bool) -> Result<NotifyPrefs, ForumError> {
@@ -434,15 +689,63 @@ impl ForumService for SurrealService {
     }
 
     fn can_link_event(&self, _user_id: i64) -> Result<bool, ForumError> {
-        Err(Self::unsupported("calendar"))
+        Ok(true)
     }
 
     fn insert_event(&self, _event: CalendarEvent) -> Result<i64, ForumError> {
-        Err(Self::unsupported("calendar"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let id = _event.id.unwrap_or_else(|| Utc::now().timestamp_millis());
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    UPDATE type::thing("calendar_events", $id) SET
+                        board_id = $board_id,
+                        topic_id = $topic_id,
+                        title = $title,
+                        location = $location,
+                        member_id = $member_id,
+                        created_at_ms = time::now();
+                    "#,
+                )
+                .bind(("id", id))
+                .bind(("board_id", _event.board_id))
+                .bind(("topic_id", _event.topic_id))
+                .bind(("title", _event.title.clone()))
+                .bind(("location", _event.location.clone()))
+                .bind(("member_id", _event.member_id))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(id)
     }
 
     fn modify_event(&self, _event_id: i64, _event: CalendarEvent) -> Result<(), ForumError> {
-        Err(Self::unsupported("calendar"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    UPDATE type::thing("calendar_events", $id) SET
+                        board_id = $board_id,
+                        topic_id = $topic_id,
+                        title = $title,
+                        location = $location,
+                        member_id = $member_id;
+                    "#,
+                )
+                .bind(("id", _event_id))
+                .bind(("board_id", _event.board_id))
+                .bind(("topic_id", _event.topic_id))
+                .bind(("title", _event.title.clone()))
+                .bind(("location", _event.location.clone()))
+                .bind(("member_id", _event.member_id))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(())
     }
 
     fn create_poll(&self, _poll: PollData) -> Result<i64, ForumError> {
@@ -1015,7 +1318,7 @@ impl ForumService for SurrealService {
                 self.client
                     .query(
                         r#"
-                        SELECT meta::id(id) as id, name, role, permissions
+                        SELECT meta::id(id) as id, name, role, permissions, password_hash
                         FROM $id
                         LIMIT 1;
                         "#,
@@ -1400,7 +1703,7 @@ impl ForumService for SurrealService {
             name: u.name,
             primary_group: None,
             additional_groups: Vec::new(),
-            password: String::new(),
+            password: u.password_hash.unwrap_or_default(),
             warning: 0,
         }))
     }
@@ -1416,27 +1719,160 @@ impl ForumService for SurrealService {
     }
 
     fn cleanup_pm_recipients(&self, _member_ids: &[i64]) -> Result<(), ForumError> {
-        Err(Self::unsupported("personal messages"))
+        if _member_ids.is_empty() {
+            return Ok(());
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let ids = _member_ids.to_vec();
+        rt.block_on(async {
+            self.client
+                .query("DELETE personal_messages WHERE owner_id IN $ids;")
+                .bind(("ids", ids))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(())
     }
 
     fn cleanup_pm_ignore_lists(&self, _member_ids: &[i64]) -> Result<(), ForumError> {
+        if _member_ids.is_empty() {
+            return Ok(());
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    DELETE pm_ignore_lists WHERE owner_id IN $ids OR ignored_id IN $ids;
+                    "#,
+                )
+                .bind(("ids", _member_ids.to_vec()))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
         Ok(())
     }
 
     fn get_pm_ignore_list(&self, _member_id: i64) -> Result<Vec<i64>, ForumError> {
-        Ok(Vec::new())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT ignored_id
+                        FROM pm_ignore_lists
+                        WHERE owner_id = $owner_id;
+                        "#,
+                    )
+                    .bind(("owner_id", _member_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            ignored_id: Option<i64>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        Ok(rows.into_iter().filter_map(|r| r.ignored_id).collect())
     }
 
     fn set_pm_ignore_list(&self, _member_id: i64, _members: &[i64]) -> Result<(), ForumError> {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let members = _members.to_vec();
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    DELETE pm_ignore_lists WHERE owner_id = $owner_id;
+                    "#,
+                )
+                .bind(("owner_id", _member_id))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+
+        if members.is_empty() {
+            return Ok(());
+        }
+
+        for ignored in members {
+            rt.block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        CREATE pm_ignore_lists CONTENT {
+                            owner_id: $owner_id,
+                            ignored_id: $ignored_id
+                        };
+                        "#,
+                    )
+                    .bind(("owner_id", _member_id))
+                    .bind(("ignored_id", ignored))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        }
         Ok(())
     }
 
     fn get_buddy_list(&self, _member_id: i64) -> Result<Vec<i64>, ForumError> {
-        Ok(Vec::new())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT buddy_id
+                        FROM buddy_lists
+                        WHERE owner_id = $owner_id;
+                        "#,
+                    )
+                    .bind(("owner_id", _member_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            buddy_id: Option<i64>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        Ok(rows.into_iter().filter_map(|r| r.buddy_id).collect())
     }
 
     fn get_pm_preferences(&self, _member_id: i64) -> Result<PmPreferenceState, ForumError> {
-        Ok(PmPreferenceState::default())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT receive_from, notify_level
+                        FROM pm_preferences
+                        WHERE owner_id = $owner_id
+                        LIMIT 1;
+                        "#,
+                    )
+                    .bind(("owner_id", _member_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            receive_from: Option<i32>,
+            notify_level: Option<i32>,
+        }
+        let row: Option<Row> = response.take(0).ok().and_then(|mut v: Vec<Row>| v.pop());
+        Ok(PmPreferenceState {
+            receive_from: row.as_ref().and_then(|r| r.receive_from).unwrap_or(0),
+            notify_level: row.and_then(|r| r.notify_level).unwrap_or(0),
+        })
     }
 
     fn save_pm_preferences(
@@ -1444,6 +1880,24 @@ impl ForumService for SurrealService {
         _member_id: i64,
         _prefs: &PmPreferenceState,
     ) -> Result<(), ForumError> {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    UPDATE type::thing("pm_preferences", $owner_id) SET
+                        owner_id = $owner_id,
+                        receive_from = $receive_from,
+                        notify_level = $notify_level;
+                    "#,
+                )
+                .bind(("owner_id", _member_id))
+                .bind(("receive_from", _prefs.receive_from))
+                .bind(("notify_level", _prefs.notify_level))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -1611,11 +2065,58 @@ impl ForumService for SurrealService {
     }
 
     fn save_pm_draft(&self, _draft: PmDraftRecord) -> Result<i64, ForumError> {
-        Err(Self::unsupported("personal messages"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let id = if _draft.id == 0 {
+            Utc::now().timestamp_millis()
+        } else {
+            _draft.id
+        };
+        let saved_at_ms = _draft.saved_at.timestamp_millis();
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    UPDATE type::thing("pm_drafts", $id) SET
+                        id = $id,
+                        owner_id = $owner_id,
+                        subject = $subject,
+                        body = $body,
+                        to_members = $to_members,
+                        bcc_members = $bcc_members,
+                        saved_at_ms = $saved_at_ms;
+                    "#,
+                )
+                .bind(("id", id))
+                .bind(("owner_id", _draft.owner_id))
+                .bind(("subject", _draft.subject.clone()))
+                .bind(("body", _draft.body.clone()))
+                .bind(("to_members", _draft.to.clone()))
+                .bind(("bcc_members", _draft.bcc.clone()))
+                .bind(("saved_at_ms", saved_at_ms))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(id)
     }
 
     fn delete_pm_draft(&self, _owner_id: i64, _draft_id: i64) -> Result<(), ForumError> {
-        Err(Self::unsupported("personal messages"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    DELETE pm_drafts
+                    WHERE id = $id AND owner_id = $owner_id;
+                    "#,
+                )
+                .bind(("id", _draft_id))
+                .bind(("owner_id", _owner_id))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(())
     }
 
     fn list_pm_drafts(
@@ -1624,7 +2125,52 @@ impl ForumService for SurrealService {
         _start: usize,
         _limit: usize,
     ) -> Result<Vec<PmDraftRecord>, ForumError> {
-        Err(Self::unsupported("personal messages"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT id, owner_id, subject, body, to_members, bcc_members, saved_at_ms
+                        FROM pm_drafts
+                        WHERE owner_id = $owner_id
+                        ORDER BY saved_at_ms DESC
+                        LIMIT $limit START $start;
+                        "#,
+                    )
+                    .bind(("owner_id", _owner_id))
+                    .bind(("limit", _limit as i64))
+                    .bind(("start", _start as i64))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            id: Option<i64>,
+            owner_id: Option<i64>,
+            subject: Option<String>,
+            body: Option<String>,
+            to_members: Option<Vec<i64>>,
+            bcc_members: Option<Vec<i64>>,
+            saved_at_ms: Option<i64>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .map(|row| PmDraftRecord {
+                id: row.id.unwrap_or(0),
+                owner_id: row.owner_id.unwrap_or(_owner_id),
+                subject: row.subject.unwrap_or_default(),
+                body: row.body.unwrap_or_default(),
+                to: row.to_members.unwrap_or_default(),
+                bcc: row.bcc_members.unwrap_or_default(),
+                saved_at: row
+                    .saved_at_ms
+                    .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+                    .unwrap_or_else(Utc::now),
+            })
+            .collect())
     }
 
     fn read_pm_draft(
@@ -1632,7 +2178,47 @@ impl ForumService for SurrealService {
         _owner_id: i64,
         _draft_id: i64,
     ) -> Result<Option<PmDraftRecord>, ForumError> {
-        Err(Self::unsupported("personal messages"))
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT id, owner_id, subject, body, to_members, bcc_members, saved_at_ms
+                        FROM pm_drafts
+                        WHERE owner_id = $owner_id AND id = $id
+                        LIMIT 1;
+                        "#,
+                    )
+                    .bind(("owner_id", _owner_id))
+                    .bind(("id", _draft_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            id: Option<i64>,
+            owner_id: Option<i64>,
+            subject: Option<String>,
+            body: Option<String>,
+            to_members: Option<Vec<i64>>,
+            bcc_members: Option<Vec<i64>>,
+            saved_at_ms: Option<i64>,
+        }
+        let row: Option<Row> = response.take(0).ok().and_then(|mut v: Vec<Row>| v.pop());
+        Ok(row.map(|r| PmDraftRecord {
+            id: r.id.unwrap_or(_draft_id),
+            owner_id: r.owner_id.unwrap_or(_owner_id),
+            subject: r.subject.unwrap_or_default(),
+            body: r.body.unwrap_or_default(),
+            to: r.to_members.unwrap_or_default(),
+            bcc: r.bcc_members.unwrap_or_default(),
+            saved_at: r
+                .saved_at_ms
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+                .unwrap_or_else(Utc::now),
+        }))
     }
 
     fn personal_message_overview(
@@ -1677,7 +2263,92 @@ impl ForumService for SurrealService {
         &self,
         _user_id: i64,
     ) -> Result<Vec<PersonalMessageLabel>, ForumError> {
-        Ok(Vec::new())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+
+        // Fetch label definitions.
+        let mut labels_resp = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT label_id, name
+                        FROM pm_labels
+                        WHERE owner_id = $owner_id
+                        ORDER BY created_at_ms DESC;
+                        "#,
+                    )
+                    .bind(("owner_id", _user_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+
+        #[derive(Deserialize)]
+        struct LabelRow {
+            label_id: Option<i64>,
+            name: String,
+        }
+        let rows: Vec<LabelRow> = labels_resp.take(0).unwrap_or_default();
+        let mut labels: std::collections::HashMap<i64, PersonalMessageLabel> = rows
+            .into_iter()
+            .map(|row| {
+                let id = row
+                    .label_id
+                    .unwrap_or_else(|| Utc::now().timestamp_millis());
+                (
+                    id,
+                    PersonalMessageLabel {
+                        id,
+                        name: row.name,
+                        messages: 0,
+                        unread: 0,
+                    },
+                )
+            })
+            .collect();
+
+        // Compute counts from messages.
+        let mut msg_resp = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT labels, is_read
+                        FROM personal_messages
+                        WHERE owner_id = $owner_id;
+                        "#,
+                    )
+                    .bind(("owner_id", _user_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+
+        #[derive(Deserialize)]
+        struct MsgRow {
+            labels: Option<Vec<i64>>,
+            is_read: Option<bool>,
+        }
+        let msg_rows: Vec<MsgRow> = msg_resp.take(0).unwrap_or_default();
+        for row in msg_rows {
+            let lbls = row.labels.unwrap_or_default();
+            let unread = row.is_read.map(|r| !r).unwrap_or(false);
+            for lbl in lbls {
+                let entry = labels.entry(lbl).or_insert(PersonalMessageLabel {
+                    id: lbl,
+                    name: format!("Label {}", lbl),
+                    messages: 0,
+                    unread: 0,
+                });
+                entry.messages += 1;
+                if unread {
+                    entry.unread += 1;
+                }
+            }
+        }
+
+        let mut result: Vec<PersonalMessageLabel> = labels.into_values().collect();
+        result.sort_by_key(|l| l.id);
+        Ok(result)
     }
 
     fn personal_message_page(
@@ -1700,6 +2371,7 @@ impl ForumService for SurrealService {
             _folder: String,
             created_at_ms: i64,
             recipients: Option<Vec<i64>>,
+            labels: Option<Vec<i64>>,
         }
 
         let folder = match _folder {
@@ -1710,23 +2382,32 @@ impl ForumService for SurrealService {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
 
+        let mut base_query = String::from(
+            r#"
+            SELECT pm_id, owner_id, sender_id, sender_name, subject, body, is_read, folder, created_at_ms, recipients, labels
+            FROM personal_messages
+            WHERE owner_id = $owner_id AND folder = $folder
+            "#,
+        );
+        if _label.unwrap_or(-1) >= 0 {
+            base_query.push_str(" AND array::contains(labels ?? [], $label)");
+        }
+        base_query.push_str(" ORDER BY created_at_ms DESC LIMIT $limit START $start;");
+
         let mut response = rt
             .block_on(async {
-                self.client
-                    .query(
-                        r#"
-                        SELECT pm_id, owner_id, sender_id, sender_name, subject, body, is_read, folder, created_at_ms, recipients
-                        FROM personal_messages
-                        WHERE owner_id = $owner_id AND folder = $folder
-                        ORDER BY created_at_ms DESC
-                        LIMIT $limit START $start;
-                        "#,
-                    )
+                let mut query = self.client.query(base_query.clone());
+                query = query
                     .bind(("owner_id", _user_id))
                     .bind(("folder", folder))
                     .bind(("limit", _limit as i64))
-                    .bind(("start", _start as i64))
-                    .await
+                    .bind(("start", _start as i64));
+                if let Some(label) = _label {
+                    if label >= 0 {
+                        query = query.bind(("label", label));
+                    }
+                }
+                query.await
             })
             .map_err(|e| ForumError::Internal(e.to_string()))?;
 
@@ -1753,27 +2434,36 @@ impl ForumService for SurrealService {
                             name: String::new(),
                         })
                         .collect(),
-                    labels: Vec::new(),
+                    labels: row.labels.unwrap_or_default(),
                 }
             })
             .collect();
 
         // counts
+        let mut count_query = String::from(
+            r#"
+            SELECT
+                count() as total,
+                count(is_read = false) as unread
+            FROM personal_messages
+            WHERE owner_id = $owner_id AND folder = $folder
+            "#,
+        );
+        if _label.unwrap_or(-1) >= 0 {
+            count_query.push_str(" AND array::contains(labels ?? [], $label)");
+        }
+        count_query.push(';');
+
         let mut counts = rt
             .block_on(async {
-                self.client
-                    .query(
-                        r#"
-                        SELECT
-                            count() as total,
-                            count(is_read = false) as unread
-                        FROM personal_messages
-                        WHERE owner_id = $owner_id AND folder = $folder;
-                        "#,
-                    )
-                    .bind(("owner_id", _user_id))
-                    .bind(("folder", folder))
-                    .await
+                let mut query = self.client.query(count_query.clone());
+                query = query.bind(("owner_id", _user_id)).bind(("folder", folder));
+                if let Some(label) = _label {
+                    if label >= 0 {
+                        query = query.bind(("label", label));
+                    }
+                }
+                query.await
             })
             .map_err(|e| ForumError::Internal(e.to_string()))?;
 
@@ -1819,6 +2509,7 @@ impl ForumService for SurrealService {
             is_read: bool,
             created_at_ms: i64,
             recipients: Option<Vec<i64>>,
+            labels: Option<Vec<i64>>,
         }
 
         let rt = tokio::runtime::Runtime::new()
@@ -1829,7 +2520,7 @@ impl ForumService for SurrealService {
                 self.client
                     .query(
                         r#"
-                        SELECT pm_id, owner_id, sender_id, sender_name, subject, body, is_read, created_at_ms, recipients
+                        SELECT pm_id, owner_id, sender_id, sender_name, subject, body, is_read, created_at_ms, recipients, labels
                         FROM personal_messages
                         WHERE owner_id = $owner_id AND pm_id = $pm_id
                         LIMIT 1;
@@ -1858,7 +2549,7 @@ impl ForumService for SurrealService {
                     name: String::new(),
                 })
                 .collect(),
-            labels: Vec::new(),
+            labels: row.labels.unwrap_or_default(),
             is_read: row.is_read,
         }))
     }
@@ -1897,7 +2588,8 @@ impl ForumService for SurrealService {
                             is_read: false,
                             folder: "Inbox",
                             created_at_ms: $created_at_ms,
-                            recipients: $recipients
+                            recipients: $recipients,
+                            labels: []
                         };
                         "#,
                     )
@@ -1928,7 +2620,8 @@ impl ForumService for SurrealService {
                         is_read: true,
                         folder: "Sent",
                         created_at_ms: $created_at_ms,
-                        recipients: $recipients
+                        recipients: $recipients,
+                        labels: []
                     };
                     "#,
                 )
@@ -2084,7 +2777,32 @@ impl ForumService for SurrealService {
     }
 
     fn create_pm_label(&self, _user_id: i64, _name: &str) -> Result<i64, ForumError> {
-        Err(Self::unsupported("personal messages"))
+        let name = _name.trim();
+        if name.is_empty() {
+            return Err(ForumError::Validation("label name required".into()));
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let id = Utc::now().timestamp_millis();
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    CREATE pm_labels CONTENT {
+                        label_id: $label_id,
+                        owner_id: $owner_id,
+                        name: $name,
+                        created_at_ms: time::now()
+                    };
+                    "#,
+                )
+                .bind(("label_id", id))
+                .bind(("owner_id", _user_id))
+                .bind(("name", name.to_string()))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(id)
     }
 
     fn rename_pm_label(
@@ -2093,11 +2811,96 @@ impl ForumService for SurrealService {
         _label_id: i64,
         _name: &str,
     ) -> Result<(), ForumError> {
-        Err(Self::unsupported("personal messages"))
+        let name = _name.trim();
+        if name.is_empty() {
+            return Err(ForumError::Validation("label name required".into()));
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    UPDATE pm_labels SET name = $name
+                    WHERE owner_id = $owner_id AND label_id = $label_id;
+                    "#,
+                )
+                .bind(("name", name.to_string()))
+                .bind(("owner_id", _user_id))
+                .bind(("label_id", _label_id))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+        Ok(())
     }
 
     fn delete_pm_labels(&self, _user_id: i64, _labels: &[i64]) -> Result<(), ForumError> {
-        Err(Self::unsupported("personal messages"))
+        if _labels.is_empty() {
+            return Ok(());
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let labels = _labels.to_vec();
+        // Remove label definitions.
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    DELETE pm_labels
+                    WHERE owner_id = $owner_id
+                      AND label_id IN $labels;
+                    "#,
+                )
+                .bind(("owner_id", _user_id))
+                .bind(("labels", labels.clone()))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
+
+        // Strip labels from existing messages.
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT pm_id, labels
+                        FROM personal_messages
+                        WHERE owner_id = $owner_id;
+                        "#,
+                    )
+                    .bind(("owner_id", _user_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            pm_id: i64,
+            labels: Option<Vec<i64>>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        let label_set: std::collections::HashSet<i64> = _labels.iter().copied().collect();
+        for row in rows {
+            let mut updated = row.labels.unwrap_or_default();
+            let len_before = updated.len();
+            updated.retain(|l| !label_set.contains(l));
+            if updated.len() != len_before {
+                rt.block_on(async {
+                    self.client
+                        .query(
+                            r#"
+                            UPDATE personal_messages SET labels = $labels
+                            WHERE owner_id = $owner_id AND pm_id = $pm_id;
+                            "#,
+                        )
+                        .bind(("labels", updated.clone()))
+                        .bind(("owner_id", _user_id))
+                        .bind(("pm_id", row.pm_id))
+                        .await
+                })
+                .map_err(|e| ForumError::Internal(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn label_personal_messages(
@@ -2107,7 +2910,58 @@ impl ForumService for SurrealService {
         _label_id: i64,
         _add: bool,
     ) -> Result<(), ForumError> {
-        Err(Self::unsupported("personal messages"))
+        if _ids.is_empty() {
+            return Ok(());
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let ids = _ids.to_vec();
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT pm_id, labels
+                        FROM personal_messages
+                        WHERE owner_id = $owner_id AND pm_id IN $ids;
+                        "#,
+                    )
+                    .bind(("owner_id", _user_id))
+                    .bind(("ids", ids))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            pm_id: i64,
+            labels: Option<Vec<i64>>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        for row in rows {
+            let mut labels = row.labels.unwrap_or_default();
+            if _add {
+                if !labels.contains(&_label_id) {
+                    labels.push(_label_id);
+                }
+            } else {
+                labels.retain(|l| l != &_label_id);
+            }
+            rt.block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        UPDATE personal_messages SET labels = $labels
+                        WHERE owner_id = $owner_id AND pm_id = $pm_id;
+                        "#,
+                    )
+                    .bind(("labels", labels.clone()))
+                    .bind(("owner_id", _user_id))
+                    .bind(("pm_id", row.pm_id))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn search_personal_messages(

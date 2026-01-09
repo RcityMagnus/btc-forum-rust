@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
-use reqwasm::http::Request;
+use reqwasm::http::{Request, RequestCredentials};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use web_sys::{window, wasm_bindgen::JsCast};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct Board {
@@ -75,7 +76,8 @@ fn main() {
 fn App() -> Element {
     let mut api_base = use_signal(|| "http://127.0.0.1:3000".to_string());
     let mut token = use_signal(|| "".to_string());
-    let mut status = use_signal(|| "等待操作...".to_string());
+let status = use_signal(|| "等待操作...".to_string());
+    let mut csrf_token = use_signal(|| "".to_string());
 
     let boards = use_signal(Vec::<Board>::new);
     let topics = use_signal(Vec::<Topic>::new);
@@ -94,12 +96,13 @@ fn App() -> Element {
     let load_boards = move || {
         let base = api_base.read().clone();
         let jwt = token.read().clone();
+        let csrf = csrf_token.read().clone();
         let mut status = status.clone();
         let mut boards = boards.clone();
         let mut selected_board = selected_board.clone();
         spawn(async move {
             status.set("加载版块中...".into());
-            match get_json::<BoardsResponse>(&base, "/surreal/boards", &jwt).await {
+            match get_json::<BoardsResponse>(&base, "/surreal/boards", &jwt, &csrf).await {
                 Ok(resp) => {
                     selected_board.set(resp.boards.get(0).and_then(|b| b.id.clone()).unwrap_or_default());
                     boards.set(resp.boards);
@@ -113,6 +116,7 @@ fn App() -> Element {
     let load_topics = move || {
         let base = api_base.read().clone();
         let jwt = token.read().clone();
+        let csrf = csrf_token.read().clone();
         let mut status = status.clone();
         let mut topics = topics.clone();
         let selected_board_id = selected_board.read().clone();
@@ -126,7 +130,7 @@ fn App() -> Element {
         spawn(async move {
             status.set("加载主题中...".into());
             let path = format!("/surreal/topics?board_id={selected_board_id}");
-            match get_json::<TopicsResponse>(&base, &path, &jwt).await {
+            match get_json::<TopicsResponse>(&base, &path, &jwt, &csrf).await {
                 Ok(resp) => {
                     selected_topic.set(resp.topics.get(0).and_then(|t| t.id.clone()).unwrap_or_default());
                     topics.set(resp.topics);
@@ -140,6 +144,7 @@ fn App() -> Element {
     let load_posts = move || {
         let base = api_base.read().clone();
         let jwt = token.read().clone();
+        let csrf = csrf_token.read().clone();
         let mut status = status.clone();
         let mut posts = posts.clone();
         let selected_topic_id = selected_topic.read().clone();
@@ -152,7 +157,7 @@ fn App() -> Element {
         spawn(async move {
             status.set("加载帖子中...".into());
             let path = format!("/surreal/topic/posts?topic_id={selected_topic_id}");
-            match get_json::<PostsResponse>(&base, &path, &jwt).await {
+            match get_json::<PostsResponse>(&base, &path, &jwt, &csrf).await {
                 Ok(resp) => {
                     posts.set(resp.posts);
                     status.set("帖子加载完成".into());
@@ -185,6 +190,12 @@ fn App() -> Element {
                     rows: "3",
                     placeholder: "Bearer token（来自认证服务）",
                 }
+                label { "CSRF Token" }
+                input {
+                    value: "{csrf_token.read()}",
+                    oninput: move |evt| csrf_token.set(evt.value()),
+                    placeholder: "可选：用于通过 CSRF 校验",
+                }
                 div { class: "actions",
                     button { onclick: move |_| load_boards(), "加载版块" }
                     button { onclick: move |_| load_topics(), "加载主题" }
@@ -216,6 +227,7 @@ fn App() -> Element {
                                 let name = new_board_name.read().clone();
                                 let desc = new_board_desc.read().clone();
                                 let mut selected_board = selected_board.clone();
+                                let csrf = csrf_token.read().clone();
 
                                 if name.trim().is_empty() {
                                     status.set("请输入版块名称".into());
@@ -225,7 +237,7 @@ fn App() -> Element {
                                 spawn(async move {
                                     status.set("创建版块中...".into());
                                     let body = CreateBoardPayload { name: name.clone(), description: if desc.trim().is_empty() { None } else { Some(desc.clone()) } };
-                                    match post_json::<BoardResponse, _>(&base, "/surreal/boards", &jwt, &body).await {
+                                    match post_json::<BoardResponse, _>(&base, "/surreal/boards", &jwt, &csrf, &body).await {
                                         Ok(resp) => {
                                             selected_board.set(resp.board.id.clone().unwrap_or_default());
                                             boards.set({
@@ -285,6 +297,7 @@ fn App() -> Element {
                                 let subject = new_topic_subject.read().clone();
                                 let body = new_topic_body.read().clone();
                                 let mut selected_topic = selected_topic.clone();
+                                let csrf = csrf_token.read().clone();
 
                                 if board_id.is_empty() {
                                     status.set("请选择一个版块".into());
@@ -298,7 +311,7 @@ fn App() -> Element {
                                 spawn(async move {
                                     status.set("创建主题中...".into());
                                     let payload = CreateTopicPayload { board_id: board_id.clone(), subject: subject.clone(), body: body.clone() };
-                                    match post_json::<TopicCreateResponse, _>(&base, "/surreal/topics", &jwt, &payload).await {
+                                    match post_json::<TopicCreateResponse, _>(&base, "/surreal/topics", &jwt, &csrf, &payload).await {
                                         Ok(resp) => {
                                             selected_topic.set(resp.topic.id.clone().unwrap_or_default());
                                             topics.set({
@@ -363,6 +376,7 @@ fn App() -> Element {
                             let topic_id = selected_topic.read().clone();
                             let subject = new_post_subject.read().clone();
                             let body = new_post_body.read().clone();
+                            let csrf = csrf_token.read().clone();
 
                             if board_id.is_empty() || topic_id.is_empty() {
                                 status.set("请先选择版块和主题".into());
@@ -373,15 +387,15 @@ fn App() -> Element {
                                 return;
                             }
 
-                            spawn(async move {
-                                status.set("发送帖子中...".into());
+                                spawn(async move {
+                                    status.set("发送帖子中...".into());
                                 let payload = CreatePostPayload {
                                     topic_id: topic_id.clone(),
                                     board_id: board_id.clone(),
                                     subject: if subject.trim().is_empty() { None } else { Some(subject.clone()) },
                                     body: body.clone(),
                                 };
-                                match post_json::<PostResponse, _>(&base, "/surreal/topic/posts", &jwt, &payload).await {
+                                match post_json::<PostResponse, _>(&base, "/surreal/topic/posts", &jwt, &csrf, &payload).await {
                                     Ok(resp) => {
                                         posts.set({
                                             let mut next = posts.read().clone();
@@ -435,13 +449,39 @@ struct CreatePostPayload {
     body: String,
 }
 
-async fn get_json<T: DeserializeOwned>(base: &str, path: &str, token: &str) -> Result<T, String> {
+fn set_csrf_cookie(token: &str) {
+    if token.trim().is_empty() {
+        return;
+    }
+    if let Some(win) = window() {
+        if let Some(doc) = win.document() {
+            if let Ok(html_doc) = doc.dyn_into::<web_sys::HtmlDocument>() {
+                let _ = html_doc.set_cookie(&format!("XSRF-TOKEN={}; Path=/", token));
+            }
+        }
+    }
+}
+
+async fn get_json<T: DeserializeOwned>(
+    base: &str,
+    path: &str,
+    token: &str,
+    csrf: &str,
+) -> Result<T, String> {
     let url = format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'));
     let mut req = Request::get(&url);
     if !token.trim().is_empty() {
         req = req.header("Authorization", &format!("Bearer {}", token.trim()));
     }
-    let resp = req.send().await.map_err(|e| format!("网络错误: {e}"))?;
+    if !csrf.trim().is_empty() {
+        set_csrf_cookie(csrf);
+        req = req.header("X-CSRF-TOKEN", csrf.trim());
+    }
+    let resp = req
+        .credentials(RequestCredentials::Include)
+        .send()
+        .await
+        .map_err(|e| format!("网络错误: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
     if !resp.ok() {
@@ -454,6 +494,7 @@ async fn post_json<T: DeserializeOwned, B: Serialize>(
     base: &str,
     path: &str,
     token: &str,
+    csrf: &str,
     body: &B,
 ) -> Result<T, String> {
     let url = format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'));
@@ -461,8 +502,13 @@ async fn post_json<T: DeserializeOwned, B: Serialize>(
     if !token.trim().is_empty() {
         req = req.header("Authorization", &format!("Bearer {}", token.trim()));
     }
+    if !csrf.trim().is_empty() {
+        set_csrf_cookie(csrf);
+        req = req.header("X-CSRF-TOKEN", csrf.trim());
+    }
     let resp = req
         .header("Content-Type", "application/json")
+        .credentials(RequestCredentials::Include)
         .send()
         .await
         .map_err(|e| format!("网络错误: {e}"))?;

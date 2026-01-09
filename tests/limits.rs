@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::Body,
     http::{Request, StatusCode},
-    middleware::{from_fn, Next},
+    middleware::{Next, from_fn},
     response::IntoResponse,
     routing::post,
 };

@@ -331,6 +331,7 @@ pub struct SurrealUser {
     pub name: String,
     pub role: Option<String>,
     pub permissions: Option<Vec<String>>,
+    pub password_hash: Option<String>,
     pub created_at: Option<String>,
 }
 
@@ -342,7 +343,7 @@ pub async fn get_user_by_name(
     let mut response = client
         .query(
             r#"
-            SELECT meta::id(id) as id, name, role, permissions, created_at
+            SELECT meta::id(id) as id, name, role, permissions, password_hash, created_at
             FROM users
             WHERE name = $name
             LIMIT 1;
@@ -359,6 +360,7 @@ pub async fn create_user(
     name: &str,
     role: Option<&str>,
     permissions: Option<&[String]>,
+    password_hash: Option<&str>,
 ) -> Result<SurrealUser, surrealdb::Error> {
     let name = name.to_owned();
     let role = role
@@ -372,13 +374,15 @@ pub async fn create_user(
                 name: $name,
                 role: $role,
                 permissions: $permissions,
+                password_hash: $password_hash,
                 created_at: time::now()
-            } RETURN meta::id(id) as id, name, role, permissions, created_at;
+            } RETURN meta::id(id) as id, name, role, permissions, password_hash, created_at;
             "#,
         )
         .bind(("name", name.clone()))
         .bind(("role", role.clone()))
         .bind(("permissions", perms.clone()))
+        .bind(("password_hash", password_hash.map(|s| s.to_string())))
         .await?;
     let user: Option<SurrealUser> = response.take(0)?;
     Ok(user.unwrap_or_else(|| SurrealUser {
@@ -386,6 +390,7 @@ pub async fn create_user(
         name,
         role: Some(role),
         permissions: Some(perms),
+        password_hash: password_hash.map(|s| s.to_string()),
         created_at: None,
     }))
 }
@@ -399,7 +404,7 @@ pub async fn ensure_user(
     if let Some(user) = get_user_by_name(client, name).await? {
         return Ok(user);
     }
-    create_user(client, name, role, permissions).await
+    create_user(client, name, role, permissions, None).await
 }
 
 /// Thin service wrapper to encapsulate SurrealDB forum operations.
@@ -495,5 +500,19 @@ impl SurrealForumService {
         permissions: Option<&[String]>,
     ) -> Result<SurrealUser, surrealdb::Error> {
         ensure_user(&self.client, name, role, permissions).await
+    }
+
+    pub async fn user_by_name(&self, name: &str) -> Result<Option<SurrealUser>, surrealdb::Error> {
+        get_user_by_name(&self.client, name).await
+    }
+
+    pub async fn create_user_with_password(
+        &self,
+        name: &str,
+        role: Option<&str>,
+        permissions: Option<&[String]>,
+        password_hash: Option<&str>,
+    ) -> Result<SurrealUser, surrealdb::Error> {
+        create_user(&self.client, name, role, permissions, password_hash).await
     }
 }

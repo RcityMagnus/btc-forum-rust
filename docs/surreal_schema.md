@@ -1,6 +1,6 @@
 # Surreal 模型约定（初版）
 
-当前 API/CLI 默认使用 SurrealDB，采用以下 collection 字段约定：
+当前 API/CLI 默认使用 SurrealDB，采用以下 collection 字段约定（迁移脚本位于 `migrations/surreal/0001_init.surql`，包含核心表及基础索引，可通过 `surreal sql --conn $SURREAL_ENDPOINT --user $SURREAL_USER --pass $SURREAL_PASS --ns ${SURREAL_NAMESPACE:-auth} --db ${SURREAL_DATABASE:-main} -f migrations/surreal/0001_init.surql` 执行）。
 
 ## boards
 - `id`: Surreal record id（字符串）
@@ -33,6 +33,7 @@
 ## users（规划）
 - `id`: Surreal record id
 - `name`: 显示名
+- `password_hash`: Argon2id 哈希（登录用），可空（外部 OAuth 创建时为空）
 - `role`: 角色（如 `admin`/`mod`/`member`/`guest`）
 - `permissions`: 数组，按需存储字符串权限（如 `post_new`/`post_reply_any` 等）
 - 其他：`created_at`/`updated_at` 等
@@ -55,6 +56,14 @@
 - `message_id`: 关联帖子 id，可空
 - `approved`: 是否通过
 - `created_at_ms`: 创建时间
+
+## drafts / pm_drafts / pm_labels / pm_preferences
+- `drafts`: `id`、`board_id`、`topic_id`、`subject`、`body`、`icon`、`smileys_enabled`、`locked`、`sticky`、`poster_time_ms`
+- `pm_drafts`: `id`、`owner_id`、`subject`、`body`、`to_members`、`bcc_members`、`saved_at_ms`
+- `pm_labels`: `label_id`、`owner_id`、`name`、`created_at_ms`
+- `pm_preferences`: `owner_id`、`receive_from`、`notify_level`
+- `pm_ignore_lists`: `owner_id`、`ignored_id`
+- `buddy_lists`: `owner_id`、`buddy_id`
 
 ## polls / poll_options（基础版）
 - `polls`: `id`、`topic_id`、`question`、`max_votes`、`change_vote`、`guest_vote`、`created_at_ms`

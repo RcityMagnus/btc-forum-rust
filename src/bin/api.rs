@@ -7,8 +7,14 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordVerifier},
+};
 use chrono::Utc;
 use dotenvy::dotenv;
+use jsonwebtoken::{EncodingKey, Header, encode};
+use rand::{rngs::OsRng, RngCore};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -25,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 use btc_forum_rust::{
     auth::AuthClaims,
     services::{ForumContext, ForumService, SendPersonalMessage, surreal::SurrealService},
+    subs_auth::hash_password,
     surreal::{SurrealForumService, SurrealPost, SurrealTopic, SurrealUser, connect_from_env},
 };
 use tower_http::cors::CorsLayer;
@@ -74,8 +81,25 @@ impl RateLimiter {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
         };
-        guard.iter().map(|(k, (count, _))| (k.clone(), *count)).collect()
+        guard
+            .iter()
+            .map(|(k, (count, _))| (k.clone(), *count))
+            .collect()
     }
+}
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    username: String,
+    password: String,
+    role: Option<String>,
+    permissions: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
 }
 
 static ENFORCE_CSRF: OnceLock<bool> = OnceLock::new();
@@ -97,6 +121,44 @@ fn require_auth(claims: &Option<AuthClaims>) -> Result<&AuthClaims, impl IntoRes
             Json(json!({"status": "error", "message": "authorization required"})),
         ))
     }
+}
+
+fn jwt_ttl_secs() -> i64 {
+    env::var("JWT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
+}
+
+fn issue_token_for_user(
+    user: &SurrealUser,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let now = Utc::now().timestamp();
+    let claims = AuthClaims {
+        sub: user.name.clone(),
+        exp: now + jwt_ttl_secs(),
+        iat: now,
+        role: user.role.clone(),
+        permissions: user.permissions.clone(),
+        session_id: None,
+    };
+    let secret = env::var("JWT_SECRET").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": "server jwt secret not configured"})),
+        )
+    })?;
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": "failed to sign token"})),
+        )
+    })
 }
 
 fn build_ctx_from_user(user: &SurrealUser, claims: &AuthClaims) -> ForumContext {
@@ -126,6 +188,23 @@ fn build_ctx_from_user(user: &SurrealUser, claims: &AuthClaims) -> ForumContext 
     }
 
     ctx
+}
+
+fn verify_password_hash(password: &str, stored: Option<&str>) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    if stored.is_empty() {
+        return false;
+    }
+    if stored.starts_with("$argon2") {
+        if let Ok(parsed) = PasswordHash::new(stored) {
+            return Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok();
+        }
+    }
+    password == stored
 }
 
 async fn ensure_user_ctx(
@@ -211,6 +290,24 @@ fn rate_key(claims: &AuthClaims, addr: Option<&std::net::SocketAddr>) -> String 
     }
 }
 
+fn generate_csrf_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn find_csrf_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookie| {
+            cookie
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("XSRF-TOKEN="))
+                .map(|v| v.to_string())
+        })
+}
+
 fn verify_csrf(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     // Simple double-submit style check: X-CSRF-TOKEN must equal Cookie XSRF-TOKEN.
     let header_token = headers
@@ -270,14 +367,38 @@ fn validate_content(
 }
 
 async fn csrf_layer(mut req: Request<Body>, next: Next) -> Response {
-    if csrf_enabled() && req.method() != Method::GET && req.method() != Method::OPTIONS {
-        let headers = req.headers().clone();
-        if let Err(err) = verify_csrf(&headers) {
-            return err.into_response();
+    let csrf_on = csrf_enabled();
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let mut set_cookie: Option<String> = None;
+
+    if csrf_on {
+        // Issue a token cookie for safe methods to reduce friction on first load.
+        if matches!(method, Method::GET | Method::OPTIONS) && find_csrf_cookie(req.headers()).is_none()
+        {
+            set_cookie = Some(generate_csrf_token());
         }
-        req.extensions_mut().insert(headers);
+
+        if !matches!(method, Method::GET | Method::OPTIONS) && !path.starts_with("/auth/") {
+            let headers = req.headers().clone();
+            if let Err(err) = verify_csrf(&headers) {
+                return err.into_response();
+            }
+            req.extensions_mut().insert(headers);
+        }
     }
-    next.run(req).await
+
+    let mut response = next.run(req).await;
+    if let Some(token) = set_cookie {
+        if let Ok(value) =
+            HeaderValue::from_str(&format!("XSRF-TOKEN={}; Path=/; SameSite=Lax", token))
+        {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    response
 }
 
 fn sanitize_input(input: &str) -> String {
@@ -290,12 +411,7 @@ fn sanitize_input(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        Router,
-        http::Request,
-        routing::post,
-        middleware::from_fn,
-    };
+    use axum::{Router, http::Request, middleware::from_fn, routing::post};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tower::ServiceExt;
 
@@ -408,6 +524,8 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/auth/register", post(register))
+        .route("/auth/login", post(login))
         .route("/ui", get(ui))
         .route("/demo/post", post(demo_post))
         .route("/demo/surreal", post(demo_surreal))
@@ -456,6 +574,7 @@ async fn main() {
         .expect("failed to bind HTTP listener");
     info!("API listening on http://{addr}");
 
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -497,6 +616,145 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             "rate_limiter_keys": rates,
         })),
     )
+}
+
+async fn register(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<RegisterRequest>,
+) -> impl IntoResponse {
+    let key = format!("register:{}", addr.ip());
+    if let Err(resp) = enforce_rate(&state, &key, 5, Duration::from_secs(60)) {
+        return resp;
+    }
+    let username = payload.username.trim();
+    if username.len() < 3 || username.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "username must be 3-64 chars"})),
+        );
+    }
+    if payload.password.len() < 6 || payload.password.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "password must be 6-128 chars"})),
+        );
+    }
+
+    match state.surreal.user_by_name(username).await {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"status": "error", "message": "user already exists"})),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            error!(error = %err, "failed to query user");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": "failed to query user"})),
+            );
+        }
+    }
+
+    let password_hash = match hash_password(&payload.password) {
+        Ok(hash) => hash,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            );
+        }
+    };
+    let role = payload.role.as_deref();
+    let perms_slice = payload.permissions.as_deref();
+    let user = match state
+        .surreal
+        .create_user_with_password(username, role, perms_slice, Some(&password_hash))
+        .await
+    {
+        Ok(user) => user,
+        Err(err) => {
+            error!(error = %err, "failed to create user");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": "failed to create user"})),
+            );
+        }
+    };
+
+    match issue_token_for_user(&user) {
+        Ok(token) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "status": "ok",
+                "token": token,
+                "user": {
+                    "name": user.name,
+                    "role": user.role,
+                    "permissions": user.permissions.unwrap_or_default(),
+                }
+            })),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<LoginRequest>,
+) -> impl IntoResponse {
+    let key = format!("login:{}", addr.ip());
+    if let Err(resp) = enforce_rate(&state, &key, 10, Duration::from_secs(60)) {
+        return resp;
+    }
+    let username = payload.username.trim();
+    if username.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "username required"})),
+        );
+    }
+    let user = match state.surreal.user_by_name(username).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"status": "error", "message": "user not found"})),
+            );
+        }
+        Err(err) => {
+            error!(error = %err, "failed to fetch user");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": "failed to fetch user"})),
+            );
+        }
+    };
+    if !verify_password_hash(&payload.password, user.password_hash.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"status": "error", "message": "invalid credentials"})),
+        );
+    }
+
+    match issue_token_for_user(&user) {
+        Ok(token) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "token": token,
+                "user": {
+                    "name": user.name,
+                    "role": user.role,
+                    "permissions": user.permissions.unwrap_or_default(),
+                }
+            })),
+        ),
+        Err(resp) => resp,
+    }
 }
 
 /// CSRF 占位：如需 CSRF 防护，可在前端携带 token（双提交或表单隐藏字段），
