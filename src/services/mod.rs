@@ -203,7 +203,7 @@ pub struct BoardSummary {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct BoardAccessEntry {
     pub id: i64,
     pub name: String,

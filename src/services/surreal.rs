@@ -1188,13 +1188,21 @@ impl ForumService for SurrealService {
         let summaries = self.list_membergroups()?;
         Ok(summaries
             .into_iter()
+            .filter(|s| match _group_type {
+                MembergroupListType::Regular => !s.is_post_group,
+                MembergroupListType::PostCount => s.is_post_group,
+            })
             .map(|s| MembergroupListEntry {
                 id: s.id,
                 name: s.name,
                 description: String::new(),
                 min_posts: 0,
                 color: s.color.clone(),
-                group_type: 0,
+                group_type: if s.is_post_group {
+                    MembergroupListType::PostCount as i32
+                } else {
+                    MembergroupListType::Regular as i32
+                },
                 num_members: s.num_members,
                 moderators: Vec::new(),
                 icons: None,
@@ -1210,7 +1218,26 @@ impl ForumService for SurrealService {
         _board_permissions: &[String],
         _profile_id: i64,
     ) -> Result<std::collections::HashMap<String, PermissionSnapshot>, ForumError> {
-        Ok(std::collections::HashMap::new())
+        let mut map = std::collections::HashMap::new();
+        for permission in _group_permissions {
+            map.insert(
+                permission.clone(),
+                PermissionSnapshot {
+                    allowed: vec![1],
+                    denied: Vec::new(),
+                },
+            );
+        }
+        for permission in _board_permissions {
+            map.insert(
+                permission.clone(),
+                PermissionSnapshot {
+                    allowed: vec![1],
+                    denied: Vec::new(),
+                },
+            );
+        }
+        Ok(map)
     }
 
     fn permission_groups(&self) -> Result<Vec<PermissionGroupContext>, ForumError> {
@@ -1360,7 +1387,48 @@ impl ForumService for SurrealService {
     }
 
     fn list_all_membergroups(&self) -> Result<Vec<MembergroupData>, ForumError> {
-        Ok(Vec::new())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT id, name, description, type, min_posts, color, hidden
+                        FROM membergroups;
+                        "#,
+                    )
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            id: Option<i64>,
+            name: Option<String>,
+            description: Option<String>,
+            r#type: Option<i32>,
+            min_posts: Option<i64>,
+            color: Option<String>,
+            hidden: Option<bool>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .map(|r| MembergroupData {
+                id: r.id,
+                name: r.name.unwrap_or_default(),
+                description: r.description.unwrap_or_default(),
+                inherits_from: None,
+                allowed_boards: Vec::new(),
+                color: r.color,
+                is_post_group: r.r#type.unwrap_or(0) == MembergroupListType::PostCount as i32,
+                min_posts: r.min_posts.unwrap_or(0),
+                group_type: r.r#type.unwrap_or(0),
+                hidden: r.hidden.unwrap_or(false),
+                icons: None,
+                is_protected: false,
+            })
+            .collect())
     }
 
     fn list_members(&self) -> Result<Vec<MemberRecord>, ForumError> {
@@ -1414,10 +1482,56 @@ impl ForumService for SurrealService {
     }
 
     fn list_board_access(&self) -> Result<Vec<BoardAccessEntry>, ForumError> {
-        Ok(Vec::new())
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT board_id, allowed_groups
+                        FROM board_access;
+                        "#,
+                    )
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            board_id: Option<i64>,
+            allowed_groups: Option<Vec<i64>>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                r.board_id.map(|bid| BoardAccessEntry {
+                    id: bid,
+                    name: String::new(),
+                    allowed_groups: r.allowed_groups.unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 
     fn set_board_access(&self, _board_id: i64, _groups: &[i64]) -> Result<(), ForumError> {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let groups = _groups.to_vec();
+        rt.block_on(async {
+            self.client
+                .query(
+                    r#"
+                    UPDATE type::thing("board_access", $board_id) SET
+                        board_id = $board_id,
+                        allowed_groups = $groups;
+                    "#,
+                )
+                .bind(("board_id", _board_id))
+                .bind(("groups", groups))
+                .await
+        })
+        .map_err(|e| ForumError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -1527,7 +1641,42 @@ impl ForumService for SurrealService {
     }
 
     fn general_permissions(&self, _group_ids: &[i64]) -> Result<Vec<PermissionChange>, ForumError> {
-        Ok(Vec::new())
+        if _group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT permissions
+                        FROM membergroups
+                        WHERE id IN $group_ids;
+                        "#,
+                    )
+                    .bind(("group_ids", _group_ids.to_vec()))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            permissions: Option<Vec<String>>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        let mut changes = Vec::new();
+        for row in rows {
+            if let Some(perms) = row.permissions {
+                for perm in perms {
+                    changes.push(PermissionChange {
+                        permission: perm,
+                        allow: true,
+                    });
+                }
+            }
+        }
+        Ok(changes)
     }
 
     fn board_permissions(
@@ -1535,7 +1684,48 @@ impl ForumService for SurrealService {
         _board_id: i64,
         _group_ids: &[i64],
     ) -> Result<Vec<PermissionChange>, ForumError> {
-        Ok(Vec::new())
+        if _group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let mut response = rt
+            .block_on(async {
+                self.client
+                    .query(
+                        r#"
+                        SELECT allow, deny
+                        FROM board_permissions
+                        WHERE board_id = $board_id AND group_id IN $group_ids;
+                        "#,
+                    )
+                    .bind(("board_id", _board_id))
+                    .bind(("group_ids", _group_ids.to_vec()))
+                    .await
+            })
+            .map_err(|e| ForumError::Internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            allow: Option<Vec<String>>,
+            deny: Option<Vec<String>>,
+        }
+        let rows: Vec<Row> = response.take(0).unwrap_or_default();
+        let mut changes = Vec::new();
+        for row in rows {
+            if let Some(perms) = row.allow {
+                changes.extend(perms.into_iter().map(|p| PermissionChange {
+                    permission: p,
+                    allow: true,
+                }));
+            }
+            if let Some(perms) = row.deny {
+                changes.extend(perms.into_iter().map(|p| PermissionChange {
+                    permission: p,
+                    allow: false,
+                }));
+            }
+        }
+        Ok(changes)
     }
 
     fn spider_group_id(&self) -> Option<i64> {

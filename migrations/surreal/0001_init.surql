@@ -97,6 +97,12 @@ DEFINE TABLE permission_profiles SCHEMALESS;
 DEFINE TABLE alert_prefs SCHEMALESS;
 DEFINE INDEX idx_alert_prefs_member ON TABLE alert_prefs COLUMNS member_id;
 
+DEFINE TABLE board_access SCHEMALESS;
+DEFINE INDEX idx_board_access_board ON TABLE board_access COLUMNS board_id;
+
+DEFINE TABLE board_permissions SCHEMALESS;
+DEFINE INDEX idx_board_permissions_board ON TABLE board_permissions COLUMNS board_id, group_id;
+
 -- Moderation / audit
 DEFINE TABLE ban_rules SCHEMALESS;
 DEFINE INDEX idx_ban_rules_expires ON TABLE ban_rules COLUMNS expires_at_ms;

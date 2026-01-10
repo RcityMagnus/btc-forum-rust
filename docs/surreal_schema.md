@@ -69,6 +69,12 @@
 - `polls`: `id`、`topic_id`、`question`、`max_votes`、`change_vote`、`guest_vote`、`created_at_ms`
 - `poll_options`: `poll_id`、`option_id`、`label`、`votes`
 
+## 权限与版块访问
+- `membergroups`: `id`、`name`、`description`、`type`、`min_posts`、`color`、`hidden`、`permissions`（数组，存储字符串权限）
+- `board_access`: `board_id`、`allowed_groups`（数组，表示可见分组）
+- `board_permissions`: `board_id`、`group_id`、`allow`（数组）、`deny`（数组）
+- `permission_groups` / `permission_profiles`: `id`、`name`、`color` 等
+
 ## ban_rules / ban_logs / action_logs
 - `ban_rules`: `id`、`reason`、`expires_at_ms`
 - `ban_logs`: `id`、`ban_id`、`email`、`hit_at_ms`

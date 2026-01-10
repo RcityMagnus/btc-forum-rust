@@ -15,7 +15,7 @@ use chrono::Utc;
 use dotenvy::dotenv;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rand::{rngs::OsRng, RngCore};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     env,
@@ -110,6 +110,18 @@ fn csrf_enabled() -> bool {
             .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true)
     })
+}
+
+fn validate_config() {
+    if env::var("JWT_SECRET").is_err() {
+        panic!("JWT_SECRET must be set for API to start");
+    }
+    if !csrf_enabled() {
+        tracing::warn!("ENFORCE_CSRF=0 (CSRF protection disabled)");
+    }
+    if env::var("SURREAL_ENDPOINT").ok().map(|v| v.is_empty()).unwrap_or(false) {
+        panic!("SURREAL_ENDPOINT cannot be empty");
+    }
 }
 
 fn require_auth(claims: &Option<AuthClaims>) -> Result<&AuthClaims, impl IntoResponse> {
@@ -506,6 +518,7 @@ mod tests {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
+    validate_config();
     init_tracing();
 
     let surreal = connect_from_env()
@@ -547,6 +560,11 @@ async fn main() {
         .route("/admin/bans", get(list_bans))
         .route("/admin/action_logs", get(list_action_logs))
         .route("/admin/notify", post(admin_notify))
+        .route("/admin/board_access", get(get_board_access).post(update_board_access))
+        .route(
+            "/admin/board_permissions",
+            get(get_board_permissions).post(update_board_permissions),
+        )
         .layer(axum::middleware::from_fn(csrf_layer))
         .layer({
             let origin = cors_origin
@@ -1332,6 +1350,20 @@ struct AdminPageQuery {
     offset: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct BoardAccessPayload {
+    board_id: i64,
+    allowed_groups: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct BoardPermissionPayload {
+    board_id: i64,
+    group_id: i64,
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
 async fn admin_notify(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
@@ -1457,6 +1489,206 @@ async fn list_action_logs(
         Ok(logs) => (StatusCode::OK, Json(json!({"status": "ok", "logs": logs}))).into_response(),
         Err(err) => {
             error!(error = %err, "failed to list action logs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_board_access(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = ensure_admin(&ctx) {
+        return resp.into_response();
+    }
+    match state.forum_service.list_board_access() {
+        Ok(entries) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "entries": entries})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list board access");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn update_board_access(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<BoardAccessPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = ensure_admin(&ctx) {
+        return resp.into_response();
+    }
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    if payload.allowed_groups.len() > 1000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "too many groups"})),
+        )
+            .into_response();
+    }
+    match state
+        .forum_service
+        .set_board_access(payload.board_id, &payload.allowed_groups)
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "board_id": payload.board_id, "allowed_groups": payload.allowed_groups})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to update board access");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct BoardPermissionEntry {
+    board_id: i64,
+    group_id: i64,
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+async fn get_board_permissions(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = ensure_admin(&ctx) {
+        return resp.into_response();
+    }
+    let mut response = match state
+        .surreal
+        .client()
+        .query(
+            r#"
+            SELECT board_id, group_id, allow, deny
+            FROM board_permissions;
+            "#,
+        )
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            error!(error = %err, "failed to list board permissions");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let entries: Vec<BoardPermissionEntry> = response.take(0).unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(json!({"status": "ok", "entries": entries})),
+    )
+        .into_response()
+}
+
+async fn update_board_permissions(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<BoardPermissionPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = ensure_admin(&ctx) {
+        return resp.into_response();
+    }
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    if payload.allow.len() + payload.deny.len() > 500 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "too many permissions"})),
+        )
+            .into_response();
+    }
+
+    let result = state
+        .surreal
+        .client()
+        .query(
+            r#"
+            UPDATE type::thing("board_permissions", string::concat("bp:", $board_id, ":", $group_id)) SET
+                board_id = $board_id,
+                group_id = $group_id,
+                allow = $allow,
+                deny = $deny;
+            "#,
+        )
+        .bind(("board_id", payload.board_id))
+        .bind(("group_id", payload.group_id))
+        .bind(("allow", payload.allow.clone()))
+        .bind(("deny", payload.deny.clone()))
+        .await;
+
+    match result {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "board_id": payload.board_id,
+                "group_id": payload.group_id,
+                "allow": payload.allow,
+                "deny": payload.deny
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to update board permissions");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"status": "error", "message": err.to_string()})),
