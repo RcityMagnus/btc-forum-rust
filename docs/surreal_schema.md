@@ -57,6 +57,13 @@
 - `approved`: 是否通过
 - `created_at_ms`: 创建时间
 
+## notifications（占位）
+- `id`: 字符串 id（Surreal 记录）
+- `user`: 接收方用户名
+- `subject` / `body`
+- `is_read`: 是否已读
+- `created_at_ms`: 创建时间
+
 ## drafts / pm_drafts / pm_labels / pm_preferences
 - `drafts`: `id`、`board_id`、`topic_id`、`subject`、`body`、`icon`、`smileys_enabled`、`locked`、`sticky`、`poster_time_ms`
 - `pm_drafts`: `id`、`owner_id`、`subject`、`body`、`to_members`、`bcc_members`、`saved_at_ms`

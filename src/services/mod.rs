@@ -205,7 +205,7 @@ pub struct BoardSummary {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BoardAccessEntry {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub allowed_groups: Vec<i64>,
 }
@@ -767,7 +767,7 @@ pub trait ForumService {
     fn list_members(&self) -> ServiceResult<Vec<MemberRecord>>;
     fn delete_member(&self, member_id: i64) -> ServiceResult<()>;
     fn list_board_access(&self) -> ServiceResult<Vec<BoardAccessEntry>>;
-    fn set_board_access(&self, board_id: i64, groups: &[i64]) -> ServiceResult<()>;
+    fn set_board_access(&self, board_id: &str, groups: &[i64]) -> ServiceResult<()>;
     fn fetch_alert_prefs(
         &self,
         members: &[i64],
@@ -780,7 +780,7 @@ pub trait ForumService {
     fn general_permissions(&self, group_ids: &[i64]) -> ServiceResult<Vec<PermissionChange>>;
     fn board_permissions(
         &self,
-        board_id: i64,
+        board_id: &str,
         group_ids: &[i64],
     ) -> ServiceResult<Vec<PermissionChange>>;
     fn spider_group_id(&self) -> Option<i64>;
@@ -907,7 +907,7 @@ pub fn ensure(condition: bool, error: ForumError) -> ServiceResult<()> {
 #[derive(Default)]
 struct InMemoryState {
     boards: HashMap<i64, BoardSummary>,
-    board_access: HashMap<i64, Vec<i64>>,
+    board_access: HashMap<String, Vec<i64>>,
     board_profiles: HashMap<i64, i64>,
     topics: HashMap<i64, TopicPostingContext>,
     messages: HashMap<i64, MessageEditData>,
@@ -1006,8 +1006,8 @@ impl InMemoryService {
                 name: "Staff".into(),
             },
         );
-        state.board_access.insert(2, vec![1]);
-        state.board_access.insert(1, vec![0, 1]);
+        state.board_access.insert("2".into(), vec![1]);
+        state.board_access.insert("1".into(), vec![0, 1]);
         state.board_profiles.insert(1, 1);
         state.board_profiles.insert(2, 2);
         state.topics.insert(
@@ -2247,20 +2247,20 @@ impl ForumService for InMemoryService {
             .boards
             .iter()
             .map(|(id, board)| BoardAccessEntry {
-                id: *id,
+                id: id.to_string(),
                 name: board.name.clone(),
                 allowed_groups: state
                     .board_access
-                    .get(id)
+                    .get(&id.to_string())
                     .cloned()
                     .unwrap_or_else(|| vec![0]),
             })
             .collect())
     }
 
-    fn set_board_access(&self, board_id: i64, groups: &[i64]) -> ServiceResult<()> {
+    fn set_board_access(&self, board_id: &str, groups: &[i64]) -> ServiceResult<()> {
         let mut state = self.state.lock().unwrap();
-        state.board_access.insert(board_id, groups.to_vec());
+        state.board_access.insert(board_id.to_string(), groups.to_vec());
         Ok(())
     }
 
@@ -2330,11 +2330,12 @@ impl ForumService for InMemoryService {
 
     fn board_permissions(
         &self,
-        board_id: i64,
+        board_id: &str,
         group_ids: &[i64],
     ) -> ServiceResult<Vec<PermissionChange>> {
         let state = self.state.lock().unwrap();
-        let profile = match state.board_profiles.get(&board_id) {
+        let board_numeric = board_id.parse::<i64>().ok();
+        let profile = match board_numeric.and_then(|id| state.board_profiles.get(&id)) {
             Some(profile) => *profile,
             None => return Ok(Vec::new()),
         };

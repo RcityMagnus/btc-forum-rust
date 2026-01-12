@@ -1489,7 +1489,8 @@ impl ForumService for SurrealService {
                 self.client
                     .query(
                         r#"
-                        SELECT board_id, allowed_groups
+                        SELECT board_id, allowed_groups,
+                            (SELECT name FROM boards WHERE id = board_id)[0].name AS name
                         FROM board_access;
                         "#,
                     )
@@ -1498,8 +1499,9 @@ impl ForumService for SurrealService {
             .map_err(|e| ForumError::Internal(e.to_string()))?;
         #[derive(Deserialize)]
         struct Row {
-            board_id: Option<i64>,
+            board_id: Option<String>,
             allowed_groups: Option<Vec<i64>>,
+            name: Option<String>,
         }
         let rows: Vec<Row> = response.take(0).unwrap_or_default();
         Ok(rows
@@ -1507,17 +1509,18 @@ impl ForumService for SurrealService {
             .filter_map(|r| {
                 r.board_id.map(|bid| BoardAccessEntry {
                     id: bid,
-                    name: String::new(),
+                    name: r.name.unwrap_or_default(),
                     allowed_groups: r.allowed_groups.unwrap_or_default(),
                 })
             })
             .collect())
     }
 
-    fn set_board_access(&self, _board_id: i64, _groups: &[i64]) -> Result<(), ForumError> {
+    fn set_board_access(&self, _board_id: &str, _groups: &[i64]) -> Result<(), ForumError> {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
         let groups = _groups.to_vec();
+        let board_id = _board_id.to_string();
         rt.block_on(async {
             self.client
                 .query(
@@ -1527,7 +1530,7 @@ impl ForumService for SurrealService {
                         allowed_groups = $groups;
                     "#,
                 )
-                .bind(("board_id", _board_id))
+                .bind(("board_id", board_id))
                 .bind(("groups", groups))
                 .await
         })
@@ -1681,7 +1684,7 @@ impl ForumService for SurrealService {
 
     fn board_permissions(
         &self,
-        _board_id: i64,
+        board_id: &str,
         _group_ids: &[i64],
     ) -> Result<Vec<PermissionChange>, ForumError> {
         if _group_ids.is_empty() {
@@ -1689,6 +1692,7 @@ impl ForumService for SurrealService {
         }
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| ForumError::Internal(format!("runtime init failed: {e}")))?;
+        let board_id_owned = board_id.to_string();
         let mut response = rt
             .block_on(async {
                 self.client
@@ -1699,7 +1703,7 @@ impl ForumService for SurrealService {
                         WHERE board_id = $board_id AND group_id IN $group_ids;
                         "#,
                     )
-                    .bind(("board_id", _board_id))
+                    .bind(("board_id", board_id_owned))
                     .bind(("group_ids", _group_ids.to_vec()))
                     .await
             })

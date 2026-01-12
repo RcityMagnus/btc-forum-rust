@@ -1,5 +1,6 @@
 use std::env;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use surrealdb::{
     Surreal,
@@ -154,6 +155,164 @@ pub async fn list_posts(client: &SurrealClient) -> Result<Vec<SurrealPost>, surr
 
     let posts: Vec<SurrealPost> = response.take(0)?;
     Ok(posts)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SurrealAttachment {
+    pub id: Option<String>,
+    pub owner: String,
+    pub filename: String,
+    pub size_bytes: i64,
+    pub mime_type: Option<String>,
+    pub board_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub message_id: Option<String>,
+    pub created_at: Option<String>,
+}
+
+pub async fn create_attachment_meta(
+    client: &SurrealClient,
+    owner: &str,
+    filename: &str,
+    size_bytes: i64,
+    mime_type: Option<&str>,
+    board_id: Option<&str>,
+    topic_id: Option<&str>,
+) -> Result<SurrealAttachment, surrealdb::Error> {
+    let mut response = client
+        .query(
+            r#"
+            CREATE attachments CONTENT {
+                owner: $owner,
+                filename: $filename,
+                size_bytes: $size_bytes,
+                mime_type: $mime,
+                board_id: $board_id,
+                topic_id: $topic_id,
+                created_at: time::now(),
+                created_at_ms: time::unix(time::now())
+            } RETURN meta::id(id) as id, owner, filename, size_bytes, mime_type, board_id, topic_id, created_at;
+            "#,
+        )
+        .bind(("owner", owner.to_string()))
+        .bind(("filename", filename.to_string()))
+        .bind(("size_bytes", size_bytes))
+        .bind(("mime", mime_type.map(|s| s.to_string())))
+        .bind(("board_id", board_id.map(|s| s.to_string())))
+        .bind(("topic_id", topic_id.map(|s| s.to_string())))
+        .await?;
+    let att: Option<SurrealAttachment> = response.take(0)?;
+    Ok(att.unwrap_or_else(|| SurrealAttachment {
+        id: None,
+        owner: owner.to_string(),
+        filename: filename.to_string(),
+        size_bytes,
+        mime_type: mime_type.map(|s| s.to_string()),
+        board_id: board_id.map(|s| s.to_string()),
+        topic_id: topic_id.map(|s| s.to_string()),
+        message_id: None,
+        created_at: None,
+    }))
+}
+
+pub async fn list_attachments_for_user(
+    client: &SurrealClient,
+    owner: &str,
+) -> Result<Vec<SurrealAttachment>, surrealdb::Error> {
+    let mut response = client
+        .query(
+            r#"
+            SELECT meta::id(id) as id, owner, filename, size_bytes, mime_type, board_id, topic_id, message_id, created_at
+            FROM attachments
+            WHERE owner = $owner
+            ORDER BY created_at DESC
+            LIMIT 200;
+            "#,
+        )
+        .bind(("owner", owner.to_string()))
+        .await?;
+    let items: Vec<SurrealAttachment> = response.take(0)?;
+    Ok(items)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SurrealNotification {
+    pub id: Option<String>,
+    pub user: String,
+    pub subject: String,
+    pub body: String,
+    pub is_read: Option<bool>,
+    pub created_at: Option<String>,
+}
+
+pub async fn create_notification(
+    client: &SurrealClient,
+    user: &str,
+    subject: &str,
+    body: &str,
+) -> Result<SurrealNotification, surrealdb::Error> {
+    let mut response = client
+        .query(
+            r#"
+            CREATE notifications CONTENT {
+                user: $user,
+                subject: $subject,
+                body: $body,
+                is_read: false,
+                created_at: time::now(),
+                created_at_ms: time::unix(time::now())
+            } RETURN meta::id(id) as id, user, subject, body, is_read, created_at;
+            "#,
+        )
+        .bind(("user", user.to_string()))
+        .bind(("subject", subject.to_string()))
+        .bind(("body", body.to_string()))
+        .await?;
+    let note: Option<SurrealNotification> = response.take(0)?;
+    Ok(note.unwrap_or_else(|| SurrealNotification {
+        id: None,
+        user: user.to_string(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+        is_read: Some(false),
+        created_at: None,
+    }))
+}
+
+pub async fn list_notifications(
+    client: &SurrealClient,
+    user: &str,
+) -> Result<Vec<SurrealNotification>, surrealdb::Error> {
+    let mut response = client
+        .query(
+            r#"
+            SELECT meta::id(id) as id, user, subject, body, is_read, created_at
+            FROM notifications
+            WHERE user = $user
+            ORDER BY created_at DESC
+            LIMIT 100;
+            "#,
+        )
+        .bind(("user", user.to_string()))
+        .await?;
+    let notes: Vec<SurrealNotification> = response.take(0)?;
+    Ok(notes)
+}
+
+pub async fn mark_notification_read(
+    client: &SurrealClient,
+    id: &str,
+) -> Result<(), surrealdb::Error> {
+    let owned = id.to_string();
+    client
+        .query(
+            r#"
+            UPDATE type::thing("notifications", $id) SET is_read = true;
+            "#,
+        )
+        .bind(("id", owned))
+        .await?;
+    Ok(())
 }
 
 pub async fn create_board(
@@ -491,6 +650,54 @@ impl SurrealForumService {
 
     pub async fn list_posts(&self) -> Result<Vec<SurrealPost>, surrealdb::Error> {
         list_posts(&self.client).await
+    }
+
+    pub async fn create_attachment_meta(
+        &self,
+        owner: &str,
+        filename: &str,
+        size_bytes: i64,
+        mime_type: Option<&str>,
+        board_id: Option<&str>,
+        topic_id: Option<&str>,
+    ) -> Result<SurrealAttachment, surrealdb::Error> {
+        create_attachment_meta(
+            &self.client,
+            owner,
+            filename,
+            size_bytes,
+            mime_type,
+            board_id,
+            topic_id,
+        )
+        .await
+    }
+
+    pub async fn list_attachments_for_user(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<SurrealAttachment>, surrealdb::Error> {
+        list_attachments_for_user(&self.client, owner).await
+    }
+
+    pub async fn create_notification(
+        &self,
+        user: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<SurrealNotification, surrealdb::Error> {
+        create_notification(&self.client, user, subject, body).await
+    }
+
+    pub async fn list_notifications(
+        &self,
+        user: &str,
+    ) -> Result<Vec<SurrealNotification>, surrealdb::Error> {
+        list_notifications(&self.client, user).await
+    }
+
+    pub async fn mark_notification_read(&self, id: &str) -> Result<(), surrealdb::Error> {
+        mark_notification_read(&self.client, id).await
     }
 
     pub async fn ensure_user(

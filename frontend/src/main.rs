@@ -85,14 +85,14 @@ struct AuthUser {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct BoardAccessEntry {
-    id: i64,
+    id: String,
     name: String,
     allowed_groups: Vec<i64>,
 }
 
 #[derive(Serialize)]
 struct BoardAccessPayload {
-    board_id: i64,
+    board_id: String,
     allowed_groups: Vec<i64>,
 }
 
@@ -105,13 +105,13 @@ struct BoardAccessResponse {
 #[derive(Deserialize)]
 struct UpdateBoardAccessResponse {
     status: String,
-    board_id: i64,
+    board_id: String,
     allowed_groups: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct BoardPermissionEntry {
-    board_id: i64,
+    board_id: String,
     group_id: i64,
     allow: Vec<String>,
     deny: Vec<String>,
@@ -125,7 +125,7 @@ struct BoardPermissionsResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct BoardPermissionsPayload {
-    board_id: i64,
+    board_id: String,
     group_id: i64,
     allow: Vec<String>,
     deny: Vec<String>,
@@ -134,7 +134,7 @@ struct BoardPermissionsPayload {
 #[derive(Deserialize)]
 struct UpdateBoardPermissionsResponse {
     status: String,
-    board_id: i64,
+    board_id: String,
     group_id: i64,
     allow: Vec<String>,
     deny: Vec<String>,
@@ -379,20 +379,17 @@ fn App() -> Element {
         let csrf = csrf_token.read().clone();
         let mut status = status.clone();
         let mut access = board_access.clone();
-        let board_id_val = access_board_id.read().trim().to_string();
+        let board_id = access_board_id.read().trim().to_string();
         let groups_raw = access_groups.read().clone();
 
         if jwt.trim().is_empty() {
             status.set("请先登录/粘贴管理员 JWT".into());
             return;
         }
-        let board_id: i64 = match board_id_val.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                status.set("请输入有效的版块 ID".into());
-                return;
-            }
-        };
+        if board_id.is_empty() {
+            status.set("请输入有效的版块 ID".into());
+            return;
+        }
         let mut groups = Vec::new();
         if !groups_raw.trim().is_empty() {
             for part in groups_raw.split(',') {
@@ -405,7 +402,7 @@ fn App() -> Element {
         spawn(async move {
             status.set("更新版块访问控制...".into());
             let payload = BoardAccessPayload {
-                board_id,
+                board_id: board_id.clone(),
                 allowed_groups: groups.clone(),
             };
             match post_json::<UpdateBoardAccessResponse, _>(
@@ -464,7 +461,7 @@ fn App() -> Element {
         let csrf = csrf_token.read().clone();
         let mut status = status.clone();
         let mut perms_sig = board_permissions.clone();
-        let bid_str = perm_board_id.read().trim().to_string();
+        let board_id = perm_board_id.read().trim().to_string();
         let gid_str = perm_group_id.read().trim().to_string();
         let allow_raw = perm_allow.read().clone();
         let deny_raw = perm_deny.read().clone();
@@ -473,13 +470,10 @@ fn App() -> Element {
             status.set("请先登录/粘贴管理员 JWT".into());
             return;
         }
-        let board_id: i64 = match bid_str.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                status.set("请输入有效的版块 ID".into());
-                return;
-            }
-        };
+        if board_id.is_empty() {
+            status.set("请输入有效的版块 ID".into());
+            return;
+        }
         let group_id: i64 = match gid_str.parse() {
             Ok(id) => id,
             Err(_) => {
@@ -505,7 +499,7 @@ fn App() -> Element {
         spawn(async move {
             status.set("更新版块权限...".into());
             let payload = BoardPermissionsPayload {
-                board_id,
+                board_id: board_id.clone(),
                 group_id,
                 allow: allow.clone(),
                 deny: deny.clone(),
@@ -1002,7 +996,7 @@ fn App() -> Element {
                             input {
                                 value: "{access_board_id.read()}",
                                 oninput: move |evt| access_board_id.set(evt.value()),
-                                placeholder: "board_id (数字)",
+                                placeholder: "board_id (Surreal 记录 ID)",
                             }
                             label { "允许分组（逗号分隔数字）" }
                             input {
@@ -1042,7 +1036,7 @@ fn App() -> Element {
                             input {
                                 value: "{perm_board_id.read()}",
                                 oninput: move |evt| perm_board_id.set(evt.value()),
-                                placeholder: "board_id",
+                                placeholder: "board_id (Surreal 记录 ID)",
                             }
                             label { "分组 ID" }
                             input {

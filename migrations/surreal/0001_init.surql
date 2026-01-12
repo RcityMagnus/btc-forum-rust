@@ -71,6 +71,11 @@ DEFINE INDEX idx_pm_send_log_sender ON TABLE pm_send_log COLUMNS sender_id, crea
 -- Attachments & drafts
 DEFINE TABLE attachments SCHEMALESS;
 DEFINE INDEX idx_attachments_msg ON TABLE attachments COLUMNS message_id;
+DEFINE INDEX idx_attachments_owner ON TABLE attachments COLUMNS owner, created_at_ms;
+
+-- Notifications (站内信占位)
+DEFINE TABLE notifications SCHEMALESS;
+DEFINE INDEX idx_notifications_user ON TABLE notifications COLUMNS user, created_at_ms;
 
 DEFINE TABLE drafts SCHEMALESS;
 DEFINE INDEX idx_drafts_owner ON TABLE drafts COLUMNS id, board_id, topic_id, poster_time_ms;

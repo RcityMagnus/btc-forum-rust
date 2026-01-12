@@ -30,9 +30,13 @@ use tracing_subscriber::EnvFilter;
 
 use btc_forum_rust::{
     auth::AuthClaims,
-    services::{ForumContext, ForumService, SendPersonalMessage, surreal::SurrealService},
+    security::load_permissions,
+    services::{
+        BanAffects, BanCondition, BanRule, ForumContext, ForumService, PersonalMessageFolder,
+        SendPersonalMessage, surreal::SurrealService,
+    },
     subs_auth::hash_password,
-    surreal::{SurrealForumService, SurrealPost, SurrealTopic, SurrealUser, connect_from_env},
+    surreal::{SurrealClient, SurrealForumService, SurrealPost, SurrealTopic, SurrealUser, connect_from_env},
 };
 use tower_http::cors::CorsLayer;
 
@@ -199,6 +203,16 @@ fn build_ctx_from_user(user: &SurrealUser, claims: &AuthClaims) -> ForumContext 
         ctx.user_info.permissions.insert("post_reply_any".into());
     }
 
+    if ctx.user_info.groups.is_empty() {
+        if ctx.user_info.is_admin {
+            ctx.user_info.groups.push(0);
+        } else if ctx.user_info.is_mod {
+            ctx.user_info.groups.extend([2, 1]);
+        } else {
+            ctx.user_info.groups.push(1);
+        }
+    }
+
     ctx
 }
 
@@ -262,6 +276,95 @@ fn ensure_permission(
             })),
         ))
     }
+}
+
+fn ensure_permission_for_board(
+    state: &AppState,
+    ctx: &ForumContext,
+    permission: &str,
+    board_id: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let mut working = ctx.clone();
+    if let Some(board) = board_id {
+        if let Err(err) = load_permissions(&state.forum_service, &mut working, Some(board.to_string())) {
+            error!(error = %err, "failed to load permissions");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": "failed to load permissions"})),
+            ));
+        }
+    }
+    ensure_permission(state, &working, permission)
+}
+
+fn user_groups(ctx: &ForumContext) -> Vec<i64> {
+    if !ctx.user_info.groups.is_empty() {
+        return ctx.user_info.groups.clone();
+    }
+    if ctx.user_info.is_admin {
+        return vec![0];
+    }
+    if ctx.user_info.is_mod {
+        return vec![2, 1];
+    }
+    vec![1]
+}
+
+fn ensure_board_access(
+    state: &AppState,
+    ctx: &ForumContext,
+    board_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if ctx.user_info.is_admin {
+        return Ok(());
+    }
+    let entries = match state.forum_service.list_board_access() {
+        Ok(entries) => entries,
+        Err(err) => {
+            error!(error = %err, "failed to load board access");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": "failed to load board access"})),
+            ));
+        }
+    };
+    let Some(entry) = entries.iter().find(|e| e.id == board_id) else {
+        return Ok(()); // no explicit rule: allow
+    };
+    if entry.allowed_groups.is_empty() {
+        return Ok(());
+    }
+    let groups = user_groups(ctx);
+    if entry
+        .allowed_groups
+        .iter()
+        .any(|gid| groups.iter().any(|g| g == gid))
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({"status": "error", "message": "board access denied"})),
+    ))
+}
+
+async fn fetch_topic_board_id(client: &SurrealClient, topic_id: &str) -> Option<String> {
+    let topic_id_owned = topic_id.to_string();
+    let mut response = client
+        .query(
+            r#"
+            SELECT board_id FROM type::thing("topics", $id) LIMIT 1;
+            "#,
+        )
+        .bind(("id", topic_id_owned))
+        .await
+        .ok()?;
+    #[derive(Deserialize)]
+    struct Row {
+        board_id: Option<String>,
+    }
+    let rows: Vec<Row> = response.take(0).ok()?;
+    rows.into_iter().find_map(|r| r.board_id)
 }
 
 fn ensure_admin(ctx: &ForumContext) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -544,6 +647,32 @@ async fn main() {
         .route("/demo/surreal", post(demo_surreal))
         .route("/surreal/post", post(surreal_post))
         .route("/surreal/posts", get(surreal_posts))
+        .route("/surreal/notifications", get(list_notifications).post(create_notification))
+        .route(
+            "/surreal/notifications/mark_read",
+            post(mark_notification_read),
+        )
+        .route(
+            "/surreal/attachments",
+            get(list_attachments).post(create_attachment_meta),
+        )
+        .route("/surreal/personal_messages", get(list_personal_messages))
+        .route(
+            "/surreal/personal_messages/send",
+            post(send_personal_message_api),
+        )
+        .route(
+            "/surreal/personal_messages/read",
+            post(mark_personal_messages_read),
+        )
+        .route(
+            "/surreal/personal_messages/delete",
+            post(delete_personal_messages_api),
+        )
+        .route(
+            "/surreal/notifications/mark_read",
+            post(mark_notification_read),
+        )
         .route(
             "/surreal/boards",
             get(surreal_boards).post(create_surreal_board),
@@ -559,6 +688,8 @@ async fn main() {
         .route("/admin/users", get(list_users))
         .route("/admin/bans", get(list_bans))
         .route("/admin/action_logs", get(list_action_logs))
+        .route("/admin/bans/apply", post(apply_ban))
+        .route("/admin/bans/revoke", post(revoke_ban))
         .route("/admin/notify", post(admin_notify))
         .route("/admin/board_access", get(get_board_access).post(update_board_access))
         .route(
@@ -872,6 +1003,7 @@ async fn demo_surreal(
 
 #[derive(Deserialize)]
 struct CreateSurrealPost {
+    board_id: String,
     subject: String,
     body: String,
 }
@@ -901,7 +1033,11 @@ async fn surreal_post(
     if let Err(resp) = verify_csrf(&headers) {
         return resp.into_response();
     }
-    if let Err(resp) = ensure_permission(&state, &ctx, "post_new") {
+    if let Err(resp) = ensure_board_access(&state, &ctx, &payload.board_id) {
+        return resp.into_response();
+    }
+    if let Err(resp) = ensure_permission_for_board(&state, &ctx, "post_new", Some(&payload.board_id))
+    {
         return resp.into_response();
     }
     let author = user.name.clone();
@@ -1014,14 +1150,43 @@ async fn create_surreal_board(
 
 async fn surreal_boards(
     State(state): State<AppState>,
-    _claims: Option<AuthClaims>,
+    claims: Option<AuthClaims>,
 ) -> impl IntoResponse {
+    let mut ctx = ForumContext::default();
+    if let Some(claims) = claims {
+        if let Ok((_user, c)) = ensure_user_ctx(&state, &claims).await {
+            ctx = c;
+        }
+    }
+    let access_rules = state.forum_service.list_board_access().ok();
     match state.surreal.list_boards().await {
-        Ok(boards) => (
-            StatusCode::OK,
-            Json(json!({"status": "ok", "boards": boards})),
-        )
-            .into_response(),
+        Ok(boards) => {
+            let filtered = match access_rules {
+                Some(rules) => boards
+                    .into_iter()
+                    .filter(|b| {
+                        if ctx.user_info.is_admin {
+                            return true;
+                        }
+                        if let Some(rule) = rules.iter().find(|r| r.id == b.id.clone().unwrap_or_default()) {
+                            if rule.allowed_groups.is_empty() {
+                                return true;
+                            }
+                            let groups = user_groups(&ctx);
+                            rule.allowed_groups.iter().any(|gid| groups.iter().any(|g| g == gid))
+                        } else {
+                            true
+                        }
+                    })
+                    .collect(),
+                None => boards,
+            };
+            (
+                StatusCode::OK,
+                Json(json!({"status": "ok", "boards": filtered})),
+            )
+                .into_response()
+        }
         Err(err) => {
             error!(error = %err, "failed to list boards");
             (
@@ -1065,7 +1230,11 @@ async fn create_surreal_topic(
     if let Err(resp) = verify_csrf(&headers) {
         return resp.into_response();
     }
-    if let Err(resp) = ensure_permission(&state, &ctx, "post_new") {
+    if let Err(resp) = ensure_board_access(&state, &ctx, &payload.board_id) {
+        return resp.into_response();
+    }
+    if let Err(resp) = ensure_permission_for_board(&state, &ctx, "post_new", Some(&payload.board_id))
+    {
         return resp.into_response();
     }
     let author = user.name.clone();
@@ -1118,9 +1287,18 @@ struct ListTopicsParams {
 
 async fn list_surreal_topics(
     State(state): State<AppState>,
-    _claims: Option<AuthClaims>,
+    claims: Option<AuthClaims>,
     Query(params): Query<ListTopicsParams>,
 ) -> impl IntoResponse {
+    let mut ctx = ForumContext::default();
+    if let Some(claims) = claims {
+        if let Ok((_user, c)) = ensure_user_ctx(&state, &claims).await {
+            ctx = c;
+        }
+    }
+    if let Err(resp) = ensure_board_access(&state, &ctx, &params.board_id) {
+        return resp.into_response();
+    }
     match state.surreal.list_topics(&params.board_id).await {
         Ok(topics) => (
             StatusCode::OK,
@@ -1175,8 +1353,13 @@ async fn create_surreal_topic_post(
     if let Err(resp) = verify_csrf(&headers) {
         return resp.into_response();
     }
+    if let Err(resp) = ensure_board_access(&state, &ctx, &payload.board_id) {
+        return resp.into_response();
+    }
     // Basic XSS mitigation by sanitizing HTML content
-    if let Err(resp) = ensure_permission(&state, &ctx, "post_reply_any") {
+    if let Err(resp) =
+        ensure_permission_for_board(&state, &ctx, "post_reply_any", Some(&payload.board_id))
+    {
         return resp.into_response();
     }
     let author = user.name.clone();
@@ -1214,9 +1397,20 @@ struct ListPostsParams {
 
 async fn list_surreal_posts_for_topic(
     State(state): State<AppState>,
-    _claims: Option<AuthClaims>,
+    claims: Option<AuthClaims>,
     Query(params): Query<ListPostsParams>,
 ) -> impl IntoResponse {
+    let mut ctx = ForumContext::default();
+    if let Some(claims) = claims {
+        if let Ok((_user, c)) = ensure_user_ctx(&state, &claims).await {
+            ctx = c;
+        }
+    }
+    if let Some(board_id) = fetch_topic_board_id(state.surreal.client(), &params.topic_id).await {
+        if let Err(resp) = ensure_board_access(&state, &ctx, &board_id) {
+            return resp.into_response();
+        }
+    }
     match state.surreal.list_posts_for_topic(&params.topic_id).await {
         Ok(posts) => (
             StatusCode::OK,
@@ -1225,6 +1419,456 @@ async fn list_surreal_posts_for_topic(
             .into_response(),
         Err(err) => {
             error!(error = %err, "failed to list posts");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateNotificationPayload {
+    user: Option<String>,
+    subject: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct MarkNotificationPayload {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct CreateAttachmentPayload {
+    filename: String,
+    size_bytes: i64,
+    mime_type: Option<String>,
+    board_id: Option<String>,
+    topic_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PersonalMessageSendPayload {
+    to: Vec<String>,
+    subject: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct PersonalMessageIdsPayload {
+    ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct PersonalMessageListQuery {
+    folder: Option<String>,
+    label: Option<i64>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+async fn create_notification(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateNotificationPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    let key = format!("notify:{}", addr.ip());
+    if let Err(resp) = enforce_rate(&state, &key, 20, Duration::from_secs(60)) {
+        return resp.into_response();
+    }
+    let target_user = if ctx.user_info.is_admin {
+        payload.user.unwrap_or_else(|| claims.sub.clone())
+    } else {
+        claims.sub.clone()
+    };
+    if payload.subject.trim().is_empty() || payload.subject.len() > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "subject must be 1-200 chars"})),
+        )
+            .into_response();
+    }
+    if payload.body.trim().is_empty() || payload.body.len() > 4000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "body must be 1-4000 chars"})),
+        )
+            .into_response();
+    }
+    match state
+        .surreal
+        .create_notification(&target_user, &sanitize_input(&payload.subject), &sanitize_input(&payload.body))
+        .await
+    {
+        Ok(note) => (
+            StatusCode::CREATED,
+            Json(json!({"status": "ok", "notification": note})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to create notification");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn mark_notification_read(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<MarkNotificationPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    if payload.id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "id required"})),
+        )
+            .into_response();
+    }
+    match state
+        .surreal
+        .mark_notification_read(&payload.id)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "id": payload.id, "user": claims.sub})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to mark notification read");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn list_attachments(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    match state.surreal.list_attachments_for_user(&claims.sub).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "attachments": items})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list attachments");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn create_attachment_meta(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateAttachmentPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    let key = format!("attach:{}", addr.ip());
+    if let Err(resp) = enforce_rate(&state, &key, 30, Duration::from_secs(60)) {
+        return resp.into_response();
+    }
+    if payload.filename.trim().is_empty() || payload.filename.len() > 255 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "filename must be 1-255 chars"})),
+        )
+            .into_response();
+    }
+    if payload.size_bytes < 0 || payload.size_bytes > 50 * 1024 * 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "size_bytes invalid"})),
+        )
+            .into_response();
+    }
+    match state
+        .surreal
+        .create_attachment_meta(
+            &claims.sub,
+            &payload.filename,
+            payload.size_bytes,
+            payload.mime_type.as_deref(),
+            payload.board_id.as_deref(),
+            payload.topic_id.as_deref(),
+        )
+        .await
+    {
+        Ok(att) => (
+            StatusCode::CREATED,
+            Json(json!({"status": "ok", "attachment": att})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to create attachment meta");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn list_personal_messages(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    Query(query): Query<PersonalMessageListQuery>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    let folder = match query.folder.as_deref().unwrap_or("inbox").to_lowercase().as_str() {
+        "sent" => PersonalMessageFolder::Sent,
+        _ => PersonalMessageFolder::Inbox,
+    };
+    let limit = query.limit.unwrap_or(50).min(200);
+    match state
+        .forum_service
+        .personal_message_page(
+            claims.sub.parse().unwrap_or(0),
+            folder.clone(),
+            Some(query.label.unwrap_or(-1)),
+            query.offset.unwrap_or(0),
+            limit,
+        ) {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "messages": page.messages, "folder": folder, "total": page.total, "unread": page.unread})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list personal messages");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn send_personal_message_api(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<PersonalMessageSendPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    if payload.to.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "recipient required"})),
+        )
+            .into_response();
+    }
+    if payload.subject.trim().is_empty() || payload.subject.len() > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "subject must be 1-200 chars"})),
+        )
+            .into_response();
+    }
+    if payload.body.trim().is_empty() || payload.body.len() > 4000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "body must be 1-4000 chars"})),
+        )
+            .into_response();
+    }
+
+    // resolve recipient ids by name
+    let mut recipient_ids = Vec::new();
+    for name in &payload.to {
+        match state.forum_service.find_member_by_name(name) {
+            Ok(Some(member)) => recipient_ids.push(member.id),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"status": "error", "message": format!("unknown recipient: {name}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let message = SendPersonalMessage {
+        sender_id: claims.sub.parse().unwrap_or(0),
+        sender_name: claims.sub.clone(),
+        to: recipient_ids,
+        bcc: Vec::new(),
+        subject: sanitize_input(&payload.subject),
+        body: sanitize_input(&payload.body),
+    };
+    match state.forum_service.send_personal_message(message) {
+        Ok(result) => (
+            StatusCode::CREATED,
+            Json(json!({"status": "ok", "sent_to": result.recipient_ids})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to send personal message");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn mark_personal_messages_read(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<PersonalMessageIdsPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    if payload.ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "ids required"})),
+        )
+            .into_response();
+    }
+    match state
+        .forum_service
+        .mark_personal_messages(claims.sub.parse().unwrap_or(0), &payload.ids, true)
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "ids": payload.ids})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to mark personal messages read");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn delete_personal_messages_api(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<PersonalMessageIdsPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    if payload.ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "ids required"})),
+        )
+            .into_response();
+    }
+    match state.forum_service.delete_personal_messages(
+        claims.sub.parse().unwrap_or(0),
+        PersonalMessageFolder::Inbox,
+        &payload.ids,
+    ) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "ids": payload.ids})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to delete personal messages");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn list_notifications(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    let target = claims.sub.clone();
+    match state.surreal.list_notifications(&target).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "notifications": items})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list notifications");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"status": "error", "message": err.to_string()})),
@@ -1339,6 +1983,13 @@ struct AdminNotifyPayload {
 }
 
 #[derive(Deserialize)]
+struct BanPayload {
+    member_id: i64,
+    reason: Option<String>,
+    hours: Option<i64>,
+}
+
+#[derive(Deserialize)]
 struct AdminUsersQuery {
     q: Option<String>,
     limit: Option<usize>,
@@ -1352,13 +2003,13 @@ struct AdminPageQuery {
 
 #[derive(Deserialize)]
 struct BoardAccessPayload {
-    board_id: i64,
+    board_id: String,
     allowed_groups: Vec<i64>,
 }
 
 #[derive(Deserialize)]
 struct BoardPermissionPayload {
-    board_id: i64,
+    board_id: String,
     group_id: i64,
     allow: Vec<String>,
     deny: Vec<String>,
@@ -1469,6 +2120,98 @@ async fn list_bans(
     }
 }
 
+async fn apply_ban(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<BanPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = ensure_admin(&ctx) {
+        return resp.into_response();
+    }
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    let hours = payload.hours.unwrap_or(24).clamp(1, 24 * 365);
+    let until = Utc::now()
+        .checked_add_signed(chrono::Duration::hours(hours))
+        .map(|dt| dt.timestamp())
+        .unwrap_or_else(|| Utc::now().timestamp());
+    let rule = BanRule {
+        id: 0,
+        reason: payload.reason.clone(),
+        expires_at: Some(chrono::DateTime::from_timestamp(until, 0).unwrap()),
+        conditions: vec![BanCondition {
+            id: 0,
+            reason: payload.reason.clone(),
+            affects: BanAffects::Account {
+                member_id: payload.member_id,
+            },
+            expires_at: Some(chrono::DateTime::from_timestamp(until, 0).unwrap()),
+        }],
+    };
+    match state.forum_service.save_ban_rule(rule) {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "ban_id": id, "member_id": payload.member_id})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to apply ban");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn revoke_ban(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<BanPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c.clone(),
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = ensure_admin(&ctx) {
+        return resp.into_response();
+    }
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    match state.forum_service.delete_ban_rule(payload.member_id) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "ban_id": payload.member_id})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to revoke ban");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn list_action_logs(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
@@ -1559,7 +2302,7 @@ async fn update_board_access(
     }
     match state
         .forum_service
-        .set_board_access(payload.board_id, &payload.allowed_groups)
+        .set_board_access(&payload.board_id, &payload.allowed_groups)
     {
         Ok(_) => (
             StatusCode::OK,
@@ -1579,7 +2322,7 @@ async fn update_board_access(
 
 #[derive(Serialize, Deserialize)]
 struct BoardPermissionEntry {
-    board_id: i64,
+    board_id: String,
     group_id: i64,
     allow: Vec<String>,
     deny: Vec<String>,
@@ -1669,7 +2412,7 @@ async fn update_board_permissions(
                 deny = $deny;
             "#,
         )
-        .bind(("board_id", payload.board_id))
+        .bind(("board_id", payload.board_id.clone()))
         .bind(("group_id", payload.group_id))
         .bind(("allow", payload.allow.clone()))
         .bind(("deny", payload.deny.clone()))
