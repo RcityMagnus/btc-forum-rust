@@ -434,6 +434,51 @@ fn App() -> Element {
         });
     };
 
+    let mark_pm_read = move |ids: Vec<i64>| {
+        let base = api_base.read().clone();
+        let jwt = token.read().clone();
+        let csrf = csrf_token.read().clone();
+        let mut status = status.clone();
+        let mut list = personal_messages.clone();
+        if jwt.trim().is_empty() || ids.is_empty() { return; }
+        spawn(async move {
+            let payload = serde_json::json!({ "ids": ids });
+            match post_json::<serde_json::Value, _>(&base, "/surreal/personal_messages/read", &jwt, &csrf, &payload).await {
+                Ok(_) => {
+                    let mut current = list.read().clone();
+                    for pm in current.iter_mut() {
+                        if payload["ids"].as_array().unwrap().iter().any(|v| v.as_i64() == Some(pm.id)) {
+                            pm.is_read = true;
+                        }
+                    }
+                    list.set(current);
+                    status.set("已标记已读".into());
+                }
+                Err(err) => status.set(format!("标记失败：{err}")),
+            }
+        });
+    };
+
+    let delete_pms = move |ids: Vec<i64>| {
+        let base = api_base.read().clone();
+        let jwt = token.read().clone();
+        let csrf = csrf_token.read().clone();
+        let mut status = status.clone();
+        let mut list = personal_messages.clone();
+        if jwt.trim().is_empty() || ids.is_empty() { return; }
+        spawn(async move {
+            let payload = serde_json::json!({ "ids": ids.clone() });
+            match post_json::<serde_json::Value, _>(&base, "/surreal/personal_messages/delete", &jwt, &csrf, &payload).await {
+                Ok(_) => {
+                    let filtered: Vec<_> = list.read().iter().cloned().filter(|pm| !ids.contains(&pm.id)).collect();
+                    list.set(filtered);
+                    status.set("已删除所选私信".into());
+                }
+                Err(err) => status.set(format!("删除失败：{err}")),
+            }
+        });
+    };
+
     let send_pm = move || {
         let base = api_base.read().clone();
         let jwt = token.read().clone();
@@ -820,6 +865,30 @@ fn App() -> Element {
                                 strong { "{n.subject}" }
                                 div { class: "meta", "用户: {n.user} | 时间: {n.created_at.clone().unwrap_or_default()} | 已读: {n.is_read.unwrap_or(false)}" }
                                 p { "{n.body}" }
+                                if !n.is_read.unwrap_or(false) {
+                                    button { class: "ghost-btn", onclick: move |_| {
+                                        let base = api_base.read().clone();
+                                        let jwt = token.read().clone();
+                                        let csrf = csrf_token.read().clone();
+                                        let mut status = status.clone();
+                                        let mut list = notifications.clone();
+                                        let note_id = n.id.clone();
+                                        spawn(async move {
+                                            let payload = serde_json::json!({ "id": note_id.clone() });
+                                            match post_json::<serde_json::Value, _>(&base, "/surreal/notifications/mark_read", &jwt, &csrf, &payload).await {
+                                                Ok(_) => {
+                                                    let mut current = list.read().clone();
+                                                    if let Some(item) = current.iter_mut().find(|item| item.id == note_id) {
+                                                        item.is_read = Some(true);
+                                                    }
+                                                    list.set(current);
+                                                    status.set("通知已标记为已读".into());
+                                                }
+                                                Err(err) => status.set(format!("标记失败：{err}")),
+                                            }
+                                        });
+                                    }, "标记已读" }
+                                }
                             }
                         }})}
                     }
@@ -877,6 +946,10 @@ fn App() -> Element {
                                 strong { "{pm.subject}" }
                                 div { class: "meta", "来自: {pm.sender_name} | 时间: {pm.sent_at} | 已读: {pm.is_read}" }
                                 p { "{pm.body}" }
+                                div { class: "actions",
+                                    button { class: "ghost-btn", onclick: move |_| mark_pm_read(vec![pm.id]), "标记已读" }
+                                    button { class: "ghost-btn", onclick: move |_| delete_pms(vec![pm.id]), "删除" }
+                                }
                             }
                         }}) }
                     }
