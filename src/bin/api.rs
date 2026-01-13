@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{ConnectInfo, Query, State},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header::HeaderName},
     middleware::Next,
     response::{Html, IntoResponse, Response},
@@ -20,10 +20,12 @@ use serde_json::json;
 use std::{
     env,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     sync::OnceLock,
     time::{Duration, Instant},
 };
+use tokio::fs;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -107,6 +109,8 @@ struct LoginRequest {
 }
 
 static ENFORCE_CSRF: OnceLock<bool> = OnceLock::new();
+static MAX_UPLOAD_MB: OnceLock<i64> = OnceLock::new();
+static ALLOWED_MIME: OnceLock<Option<Vec<String>>> = OnceLock::new();
 
 fn csrf_enabled() -> bool {
     *ENFORCE_CSRF.get_or_init(|| {
@@ -114,6 +118,39 @@ fn csrf_enabled() -> bool {
             .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true)
     })
+}
+
+fn upload_dir() -> PathBuf {
+    PathBuf::from(env::var("UPLOAD_DIR").unwrap_or_else(|_| "uploads".into()))
+}
+
+fn upload_base_url() -> String {
+    env::var("UPLOAD_BASE_URL").unwrap_or_else(|_| "/uploads".into())
+}
+
+fn max_upload_bytes() -> i64 {
+    *MAX_UPLOAD_MB.get_or_init(|| {
+        env::var("MAX_UPLOAD_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(50)
+    }) * 1024 * 1024
+}
+
+fn allowed_mime() -> Option<&'static [String]> {
+    ALLOWED_MIME
+        .get_or_init(|| {
+            env::var("ALLOWED_MIME")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+        })
+        .as_deref()
 }
 
 fn validate_config() {
@@ -181,6 +218,7 @@ fn build_ctx_from_user(user: &SurrealUser, claims: &AuthClaims) -> ForumContext 
     let mut ctx = ForumContext::default();
     ctx.user_info.is_guest = false;
     ctx.user_info.name = user.name.clone();
+    ctx.user_info.id = user.legacy_id();
 
     if let Some(role) = user.role.as_deref().or_else(|| claims.role.as_deref()) {
         match role {
@@ -523,6 +561,21 @@ fn sanitize_input(input: &str) -> String {
         .to_string()
 }
 
+fn sanitize_filename(name: &str) -> String {
+    let base = name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(name);
+    let mut cleaned: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        cleaned = format!("upload-{}.bin", Utc::now().timestamp_millis());
+    }
+    cleaned
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,6 +709,15 @@ async fn main() {
             "/surreal/attachments",
             get(list_attachments).post(create_attachment_meta),
         )
+        .route(
+            "/surreal/attachments/delete",
+            post(delete_attachment_api),
+        )
+        .route(
+            "/surreal/attachments/upload",
+            post(upload_attachment),
+        )
+        .route("/uploads/*path", get(serve_upload))
         .route("/surreal/personal_messages", get(list_personal_messages))
         .route(
             "/surreal/personal_messages/send",
@@ -1580,10 +1642,11 @@ async fn list_attachments(
         Ok(c) => c,
         Err(resp) => return resp.into_response(),
     };
+    let base_url = upload_base_url();
     match state.surreal.list_attachments_for_user(&claims.sub).await {
         Ok(items) => (
             StatusCode::OK,
-            Json(json!({"status": "ok", "attachments": items})),
+            Json(json!({"status": "ok", "attachments": items, "base_url": base_url})),
         )
             .into_response(),
         Err(err) => {
@@ -1622,13 +1685,26 @@ async fn create_attachment_meta(
         )
             .into_response();
     }
-    if payload.size_bytes < 0 || payload.size_bytes > 50 * 1024 * 1024 {
+    if payload.size_bytes < 0 || payload.size_bytes > max_upload_bytes() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"status": "error", "message": "size_bytes invalid"})),
         )
             .into_response();
     }
+    if let Some(list) = allowed_mime() {
+        if let Some(mt) = payload.mime_type.as_deref() {
+            let mt_lower = mt.to_lowercase();
+            if !list.iter().any(|allowed| mt_lower.starts_with(allowed)) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"status": "error", "message": "mime_type not allowed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let base_url = upload_base_url();
     match state
         .surreal
         .create_attachment_meta(
@@ -1643,7 +1719,7 @@ async fn create_attachment_meta(
     {
         Ok(att) => (
             StatusCode::CREATED,
-            Json(json!({"status": "ok", "attachment": att})),
+            Json(json!({"status": "ok", "attachment": att, "base_url": base_url})),
         )
             .into_response(),
         Err(err) => {
@@ -1657,6 +1733,269 @@ async fn create_attachment_meta(
     }
 }
 
+async fn upload_attachment(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    let key = format!("attach_upload:{}", addr.ip());
+    if let Err(resp) = enforce_rate(&state, &key, 10, Duration::from_secs(60)) {
+        return resp.into_response();
+    }
+
+    let mut file_bytes: Option<Bytes> = None;
+    let mut file_name: Option<String> = None;
+    let mut mime: Option<String> = None;
+    let mut board_id: Option<String> = None;
+    let mut topic_id: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().map(|s| s.to_string());
+        match name.as_deref() {
+            Some("file") => {
+                file_name = field.file_name().map(|s| s.to_string());
+                mime = field.content_type().map(|s| s.to_string());
+                match field.bytes().await {
+                    Ok(bytes) => file_bytes = Some(bytes),
+                    Err(err) => {
+                        error!(error = %err, "failed to read upload");
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"status": "error", "message": "failed to read upload"})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            Some("board_id") => {
+                if let Ok(text) = field.text().await {
+                    board_id = Some(text);
+                }
+            }
+            Some("topic_id") => {
+                if let Ok(text) = field.text().await {
+                    topic_id = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(bytes) = file_bytes else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "missing file field"})),
+        )
+            .into_response();
+    };
+    let raw_name = file_name.unwrap_or_else(|| "upload.bin".into());
+    let safe_name = sanitize_filename(&raw_name);
+    let size_bytes = bytes.len() as i64;
+    if size_bytes == 0 || size_bytes > max_upload_bytes() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "file size must be 1..max"})),
+        )
+            .into_response();
+    }
+    if let Some(list) = allowed_mime() {
+        if let Some(mt) = mime.clone() {
+            let mt_lower = mt.to_lowercase();
+            if !list.iter().any(|allowed| mt_lower.starts_with(allowed)) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"status": "error", "message": "mime_type not allowed"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let dir = upload_dir();
+    if let Err(err) = fs::create_dir_all(&dir).await {
+        error!(error = %err, "failed to create upload dir");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": "server cannot create upload dir"})),
+        )
+            .into_response();
+    }
+
+    let mut path = dir.join(&safe_name);
+    let (stem, ext) = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(stem) => (stem.to_string(), path.extension().and_then(|e| e.to_str()).map(|e| e.to_string())),
+        None => (safe_name.clone(), None),
+    };
+    let mut counter = 1;
+    while fs::try_exists(&path).await.unwrap_or(false) {
+        let new_name = if let Some(ext) = &ext {
+            format!("{stem}-{counter}.{ext}")
+        } else {
+            format!("{stem}-{counter}")
+        };
+        path = dir.join(&new_name);
+        counter += 1;
+    }
+    let final_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&safe_name)
+        .to_string();
+
+    if let Err(err) = fs::write(&path, &bytes).await {
+        error!(error = %err, "failed to write upload");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "message": "failed to write upload"})),
+        )
+            .into_response();
+    }
+
+    let base_url = upload_base_url();
+    let public_url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        &final_name
+    );
+
+    match state
+        .surreal
+        .create_attachment_meta(
+            &claims.sub,
+            &final_name,
+            size_bytes,
+            mime.as_deref(),
+            board_id.as_deref(),
+            topic_id.as_deref(),
+        )
+        .await
+    {
+        Ok(att) => (
+            StatusCode::CREATED,
+            Json(json!({"status": "ok", "attachment": att, "url": public_url, "base_url": base_url})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to store attachment meta");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteAttachmentPayload {
+    id: String,
+}
+
+async fn delete_attachment_api(
+    State(state): State<AppState>,
+    claims: Option<AuthClaims>,
+    headers: HeaderMap,
+    Json(payload): Json<DeleteAttachmentPayload>,
+) -> impl IntoResponse {
+    let claims = match require_auth(&claims) {
+        Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    if let Err(resp) = verify_csrf(&headers) {
+        return resp.into_response();
+    }
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
+    let id_num = payload
+        .id
+        .split(':')
+        .last()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    if id_num <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "invalid id"})),
+        )
+            .into_response();
+    }
+    // Only owner or admin can delete.
+    if !ctx.user_info.is_admin {
+        match state.surreal.list_attachments_for_user(&claims.sub).await {
+            Ok(items) => {
+                if !items.iter().any(|a| a.id.as_deref() == Some(&payload.id)) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"status": "error", "message": "not allowed to delete"})),
+                    )
+                        .into_response();
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "failed to load attachments for delete");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"status": "error", "message": "cannot verify ownership"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    match state.forum_service.delete_attachment(id_num) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "id": payload.id})),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, user = %claims.sub, "failed to delete attachment");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "error", "message": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn serve_upload(Path(path): axum::extract::Path<String>) -> impl IntoResponse {
+    let mut full = upload_dir();
+    // basic traversal guard
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            continue;
+        }
+        full.push(segment);
+    }
+    match fs::read(&full).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                error!(error = %err, ?full, "failed to read uploaded file");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+    }
+}
+
 async fn list_personal_messages(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
@@ -1664,6 +2003,10 @@ async fn list_personal_messages(
 ) -> impl IntoResponse {
     let claims = match require_auth(&claims) {
         Ok(c) => c,
+        Err(resp) => return resp.into_response(),
+    };
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
         Err(resp) => return resp.into_response(),
     };
     let folder = match query.folder.as_deref().unwrap_or("inbox").to_lowercase().as_str() {
@@ -1674,9 +2017,9 @@ async fn list_personal_messages(
     match state
         .forum_service
         .personal_message_page(
-            claims.sub.parse().unwrap_or(0),
+            ctx.user_info.id,
             folder.clone(),
-            Some(query.label.unwrap_or(-1)),
+            query.label,
             query.offset.unwrap_or(0),
             limit,
         ) {
@@ -1730,6 +2073,10 @@ async fn send_personal_message_api(
         )
             .into_response();
     }
+    let (user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
 
     // resolve recipient ids by name
     let mut recipient_ids = Vec::new();
@@ -1747,8 +2094,8 @@ async fn send_personal_message_api(
     }
 
     let message = SendPersonalMessage {
-        sender_id: claims.sub.parse().unwrap_or(0),
-        sender_name: claims.sub.clone(),
+        sender_id: ctx.user_info.id,
+        sender_name: user.name.clone(),
         to: recipient_ids,
         bcc: Vec::new(),
         subject: sanitize_input(&payload.subject),
@@ -1791,9 +2138,13 @@ async fn mark_personal_messages_read(
         )
             .into_response();
     }
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
     match state
         .forum_service
-        .mark_personal_messages(claims.sub.parse().unwrap_or(0), &payload.ids, true)
+        .mark_personal_messages(ctx.user_info.id, &payload.ids, true)
     {
         Ok(_) => (
             StatusCode::OK,
@@ -1831,8 +2182,12 @@ async fn delete_personal_messages_api(
         )
             .into_response();
     }
+    let (_user, ctx) = match ensure_user_ctx(&state, &claims).await {
+        Ok(value) => value,
+        Err(resp) => return resp.into_response(),
+    };
     match state.forum_service.delete_personal_messages(
-        claims.sub.parse().unwrap_or(0),
+        ctx.user_info.id,
         PersonalMessageFolder::Inbox,
         &payload.ids,
     ) {

@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::env;
+use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -492,6 +494,27 @@ pub struct SurrealUser {
     pub permissions: Option<Vec<String>>,
     pub password_hash: Option<String>,
     pub created_at: Option<String>,
+}
+
+impl SurrealUser {
+    /// Provide a stable numeric identifier for legacy code paths that still expect i64 ids.
+    /// Prefer numeric record ids when present; otherwise hash the username.
+    pub fn legacy_id(&self) -> i64 {
+        if let Some(id) = self
+            .id
+            .as_deref()
+            .and_then(|rid| rid.split(':').last())
+            .and_then(|s| s.parse().ok())
+        {
+            if id != 0 {
+                return id;
+            }
+        }
+        let mut hasher = DefaultHasher::new();
+        self.name.hash(&mut hasher);
+        let hashed = (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as i64;
+        if hashed == 0 { 1 } else { hashed }
+    }
 }
 
 pub async fn get_user_by_name(

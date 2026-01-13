@@ -1888,12 +1888,7 @@ impl ForumService for SurrealService {
             .block_on(get_user_by_name(&self.client, &name))
             .map_err(|e| ForumError::Internal(e.to_string()))?;
         Ok(user.map(|u| MemberRecord {
-            id: u
-                .id
-                .as_deref()
-                .and_then(|id| id.split(':').last())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+            id: u.legacy_id(),
             name: u.name,
             primary_group: None,
             additional_groups: Vec::new(),
