@@ -24,7 +24,7 @@ tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 ammonia = "3"
 argon2 = { version = "0.5", features = ["std"] }
 rand = "0.8"
-rust-auth = { git = "https://github.com/RcityHarold/Rainbow-Auth.git", branch = "main" }
+rust-auth = { path = "vendor/rust-auth" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

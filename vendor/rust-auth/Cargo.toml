@@ -1,0 +1,11 @@
+[package]
+name = "rust-auth"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Stub library placeholder for Rainbow-Auth integration"
+
+[lib]
+name = "rust_auth"
+path = "src/lib.rs"
+
