@@ -222,8 +222,6 @@ impl ForumService for SurrealService {
         struct TopicRow {
             board_id: Option<String>,
             subject: Option<String>,
-            created_at: Option<String>,
-            updated_at: Option<String>,
         }
         let topic: Option<TopicRow> = response.take(0).ok().and_then(|mut v: Vec<TopicRow>| v.pop());
         let Some(topic) = topic else {

@@ -2352,8 +2352,8 @@ struct AdminUsersQuery {
 
 #[derive(Deserialize)]
 struct AdminPageQuery {
-    limit: Option<usize>,
-    offset: Option<usize>,
+    _limit: Option<usize>,
+    _offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
