@@ -596,7 +596,6 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "rand 0.8.5",
- "rust-auth",
  "serde",
  "serde_json",
  "sha2",
@@ -3454,10 +3453,6 @@ dependencies = [
  "serde",
  "smallvec",
 ]
-
-[[package]]
-name = "rust-auth"
-version = "0.1.0"
 
 [[package]]
 name = "rust-stemmers"

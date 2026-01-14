@@ -154,8 +154,10 @@ fn allowed_mime() -> Option<&'static [String]> {
 }
 
 fn validate_config() {
-    if env::var("JWT_SECRET").is_err() {
-        panic!("JWT_SECRET must be set for API to start");
+    let has_secret = env::var("JWT_SECRET").is_ok();
+    let has_pub = env::var("JWT_PUBLIC_KEY_PEM").is_ok();
+    if !has_secret && !has_pub {
+        panic!("either JWT_SECRET or JWT_PUBLIC_KEY_PEM must be set for JWT validation");
     }
     if !csrf_enabled() {
         tracing::warn!("ENFORCE_CSRF=0 (CSRF protection disabled)");
@@ -198,7 +200,7 @@ fn issue_token_for_user(
     let secret = env::var("JWT_SECRET").map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"status": "error", "message": "server jwt secret not configured"})),
+            Json(json!({"status": "error", "message": "token signing disabled (JWT_SECRET not set)"})),
         )
     })?;
     encode(

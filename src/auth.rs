@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::OnceLock};
 
 use axum::{
     RequestPartsExt, async_trait,
@@ -8,7 +8,7 @@ use axum::{
 };
 use axum_extra::TypedHeader;
 use axum_extra::headers::{Authorization, authorization::Bearer};
-use jsonwebtoken::{DecodingKey, Validation, decode};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 
 /// JWT Claims expected from Rainbow-Auth tokens.
@@ -27,7 +27,7 @@ pub struct AuthClaims {
 pub enum AuthError {
     MissingToken,
     InvalidToken,
-    MissingSecret,
+    MissingKey,
 }
 
 impl IntoResponse for AuthError {
@@ -36,15 +36,37 @@ impl IntoResponse for AuthError {
         let status = match self {
             AuthError::MissingToken => StatusCode::UNAUTHORIZED,
             AuthError::InvalidToken => StatusCode::UNAUTHORIZED,
-            AuthError::MissingSecret => StatusCode::INTERNAL_SERVER_ERROR,
+            AuthError::MissingKey => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let msg = match self {
             AuthError::MissingToken => "missing bearer token",
             AuthError::InvalidToken => "invalid token",
-            AuthError::MissingSecret => "server jwt secret not configured",
+            AuthError::MissingKey => "jwt key not configured",
         };
         (status, msg).into_response()
     }
+}
+
+fn decoding_config() -> Result<&'static (DecodingKey, Validation), AuthError> {
+    static DECODING: OnceLock<(DecodingKey, Validation)> = OnceLock::new();
+
+    if let Some(cfg) = DECODING.get() {
+        return Ok(cfg);
+    }
+
+    let computed = if let Ok(pem) = env::var("JWT_PUBLIC_KEY_PEM") {
+        let key = DecodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| AuthError::InvalidToken)?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = true;
+        (key, validation)
+    } else {
+        let secret = env::var("JWT_SECRET").map_err(|_| AuthError::MissingKey)?;
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        (DecodingKey::from_secret(secret.as_bytes()), validation)
+    };
+
+    Ok(DECODING.get_or_init(|| computed))
 }
 
 #[async_trait]
@@ -60,14 +82,10 @@ where
             .await
             .map_err(|_| AuthError::MissingToken)?;
 
-        let secret = env::var("JWT_SECRET").map_err(|_| AuthError::MissingSecret)?;
+        let (decoding_key, validation) = decoding_config()?;
 
-        let token_data = decode::<AuthClaims>(
-            bearer.token(),
-            &DecodingKey::from_secret(secret.as_bytes()),
-            &Validation::default(),
-        )
-        .map_err(|_| AuthError::InvalidToken)?;
+        let token_data =
+            decode::<AuthClaims>(bearer.token(), decoding_key, validation).map_err(|_| AuthError::InvalidToken)?;
 
         Ok(token_data.claims)
     }
