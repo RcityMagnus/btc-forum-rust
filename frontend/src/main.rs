@@ -160,37 +160,37 @@ fn App() -> Element {
     let mut login_password = use_signal(|| "".to_string());
     let mut register_username = use_signal(|| "".to_string());
     let mut register_password = use_signal(|| "".to_string());
-    let mut register_admin = use_signal(|| false);
+    let register_admin = use_signal(|| false);
 
     let boards = use_signal(Vec::<Board>::new);
     let mut topics = use_signal(Vec::<Topic>::new);
     let mut posts = use_signal(Vec::<Post>::new);
-    let mut board_access = use_signal(Vec::<BoardAccessEntry>::new);
-    let mut board_permissions = use_signal(Vec::<BoardPermissionEntry>::new);
-    let mut notifications = use_signal(Vec::<Notification>::new);
-    let mut attachments = use_signal(Vec::<AttachmentMeta>::new);
+    let board_access = use_signal(Vec::<BoardAccessEntry>::new);
+    let board_permissions = use_signal(Vec::<BoardPermissionEntry>::new);
+    let notifications = use_signal(Vec::<Notification>::new);
+    let attachments = use_signal(Vec::<AttachmentMeta>::new);
     let attachment_base_url = use_signal(|| "/uploads".to_string());
     let mut pm_folder = use_signal(|| "inbox".to_string());
-    let mut personal_messages = use_signal(Vec::<PersonalMessage>::new);
-    let mut pm_to = use_signal(|| "".to_string());
-    let mut pm_subject = use_signal(|| "".to_string());
-    let mut pm_body = use_signal(|| "".to_string());
-    let mut selected_board = use_signal(|| "".to_string());
-    let mut selected_topic = use_signal(|| "".to_string());
-    let mut new_topic_subject = use_signal(|| "".to_string());
-    let mut new_topic_body = use_signal(|| "".to_string());
-    let mut new_post_subject = use_signal(|| "".to_string());
-    let mut new_post_body = use_signal(|| "".to_string());
-    let mut access_board_id = use_signal(|| "".to_string());
-    let mut access_groups = use_signal(|| "".to_string());
-    let mut perm_board_id = use_signal(|| "".to_string());
-    let mut perm_group_id = use_signal(|| "".to_string());
-    let mut perm_allow = use_signal(|| "".to_string());
-    let mut perm_deny = use_signal(|| "".to_string());
-    let mut ban_member_id = use_signal(|| "".to_string());
-    let mut ban_hours = use_signal(|| "24".to_string());
-    let mut ban_reason = use_signal(|| "".to_string());
-    let mut bans = use_signal(Vec::<BanRuleView>::new);
+    let personal_messages = use_signal(Vec::<PersonalMessage>::new);
+    let pm_to = use_signal(|| "".to_string());
+    let pm_subject = use_signal(|| "".to_string());
+    let pm_body = use_signal(|| "".to_string());
+    let selected_board = use_signal(|| "".to_string());
+    let selected_topic = use_signal(|| "".to_string());
+    let new_topic_subject = use_signal(|| "".to_string());
+    let new_topic_body = use_signal(|| "".to_string());
+    let new_post_subject = use_signal(|| "".to_string());
+    let new_post_body = use_signal(|| "".to_string());
+    let access_board_id = use_signal(|| "".to_string());
+    let access_groups = use_signal(|| "".to_string());
+    let perm_board_id = use_signal(|| "".to_string());
+    let perm_group_id = use_signal(|| "".to_string());
+    let perm_allow = use_signal(|| "".to_string());
+    let perm_deny = use_signal(|| "".to_string());
+    let ban_member_id = use_signal(|| "".to_string());
+    let ban_hours = use_signal(|| "24".to_string());
+    let ban_reason = use_signal(|| "".to_string());
+    let bans = use_signal(Vec::<BanRuleView>::new);
 
     // actions (login/register etc.)
     let login = move || {
@@ -598,7 +598,7 @@ fn App() -> Element {
         let jwt = token.read().clone();
         let csrf = csrf_token.read().clone();
         let mut status = status.clone();
-        let mut bans_sig = bans.clone();
+        let bans_sig = bans.clone();
         let member_id = ban_member_id.read().trim().parse::<i64>().unwrap_or(0);
         let hours = ban_hours.read().trim().parse::<i64>().unwrap_or(0);
         let reason = ban_reason.read().clone();
@@ -619,7 +619,7 @@ fn App() -> Element {
         let jwt = token.read().clone();
         let csrf = csrf_token.read().clone();
         let mut status = status.clone();
-        let mut bans_sig = bans.clone();
+        let bans_sig = bans.clone();
         if jwt.trim().is_empty() { status.set("请先登录/粘贴管理员 JWT".into()); return; }
         spawn(async move {
             status.set("解除封禁中...".into());
@@ -646,7 +646,7 @@ fn App() -> Element {
         let jwt = token.read().clone();
         let csrf = csrf_token.read().clone();
         let bans_sig = bans.clone();
-        let mut status = status.clone();
+        let status = status.clone();
         spawn(load_bans_inner(base, jwt, csrf, bans_sig, status.clone()));
     };
 
@@ -931,6 +931,14 @@ fn App() -> Element {
                     div { class: "actions",
                         select { value: "{pm_folder.read()}", onchange: move |evt| pm_folder.set(evt.value()), option { value: "inbox", "收件箱" } option { value: "sent", "发件箱" } }
                         button { onclick: move |_| load_pms(), "刷新" }
+                        button { onclick: move |_| {
+                            let ids: Vec<i64> = personal_messages.read().iter().filter(|pm| !pm.is_read).map(|pm| pm.id).collect();
+                            mark_pm_read(ids);
+                        }, "全部标记已读" }
+                        button { onclick: move |_| {
+                            let ids: Vec<i64> = personal_messages.read().iter().map(|pm| pm.id).collect();
+                            delete_pms(ids);
+                        }, "删除全部" }
                     }
                     h4 { "发送私信" }
                     div { class: "stack",
